@@ -124,6 +124,19 @@ the rotation live only in memory/session context.
   `max_num_batched_tokens=7168` is safely under the indexer-oversubscription
   ceiling they measured on the same attention backend (they hit it at
   8192, we've run 7168 stably across dozens of boots).
+- **brandonmmusic-max/glm-5.3-flash-exl3-4bpw** — added 2026-09-25 at user
+  request. Same "brandonmusic" identity referenced elsewhere in this file
+  as the HF account behind the EXL3 4bpw checkpoint family (confirmed via
+  their own README's licensing back-reference). Off-target on hardware
+  (SM120 discrete Blackwell, not our SM121/GB10 unified-memory nodes),
+  quant (calibrated NVFP4 MLA KV cache, not our fp8), and parallelism
+  (TP2/EP2/DCP2, not our plain TP2). Runtime ships as a sealed, closed
+  OCI image (provenance-hashed) -- nothing to backport even in principle.
+  Quiet since 2026-08-29. Low priority, tracked passively.
+- **gabewillen/GLM-5.3-Flash-EXL3-2x-DGX-Sparks** — added 2026-09-25 at
+  user request. Surfaced via Enntity/sparkglm's 09-22 commit, which cited
+  it as the source of some NVMe-transport code they copied. Not yet
+  triaged -- first-pass check pending.
 
 ## Where to look for common problems
 
@@ -1585,6 +1598,24 @@ real throughput given current traffic patterns -- deprioritize versus
 the original "plausible real win" framing. Worth revisiting only if
 concurrency/traffic shape changes meaningfully (e.g. many simultaneous
 long-context requests becoming routine, which isn't the case today).
+
+**Status update (2026-09-25): dual-rail is now live in production**
+(`NCCL_IB_HCA=rocep1s0f0,roceP2p1s0f0`, confirmed via the running
+container's env -- this happened at some point between 09-16 and now,
+not specifically flagged when it shipped). Re-queried the same
+`node_infiniband` counters over the trailing 7 days: peak observed on
+either rail is **~4.82-4.84 Gbit/s** (both nodes, both rails,
+consistent with each other and near-identical to the original 4.9
+Gbit/s reading) -- still **~2.4% of the 200 Gbit/s per-rail ceiling**,
+even now that dual-rail is active and has had over a week of real
+traffic to potentially show a different pattern. The original
+conclusion holds and is now doubly confirmed: this fleet is not
+network-bandwidth-bound, on one rail or two. Directly answers the
+natural follow-up ("what about connecting the second port on each
+ConnectX-7 card too, for 4 rails total?") -- **not worth it**. Two
+already-active rails are barely touched; a third and fourth would be
+solving a problem this workload doesn't have. Revisit only if
+concurrency/traffic shape changes meaningfully from today's pattern.
 
 ## Ampere-fallback GEMM deep-dive: closed on the LM head, a real new lead elsewhere (2026-09-16)
 
@@ -3707,3 +3738,95 @@ considering this closed. This test was driven directly rather than
 delegated to an unattended fork, given the process lesson from the
 DFlash2 incident immediately above -- single boot cycle, real-time
 supervision throughout, no incident.
+
+## Upstream check, 2026-09-25 (delta since 09-23, plus one new repo)
+
+Full sweep across all 9 tracked repos (including brandonmmusic-max,
+added this round), read-only, run entirely via research delegation
+while production traffic was live and could not be interrupted --
+no boots, no config changes, nothing touched on the running cluster.
+One repo's finding was spot-checked directly against production with
+a real request (see below); everything else is desk research.
+
+**Two real candidates this round, both from mmastrac/glm-5.3-flash-4x-gx10**
+(commit `dde02f4`, 2026-09-23, "Move to a stock vLLM nightly, mentat
+0.12, and both ConnectX roots"):
+
+1. **Dual-PCIe-root NCCL fabric -- already in place, correction to this
+   section's own first draft.** Their `FABRIC_SUBNETS` config uses both
+   ConnectX-7 PCIe roots together and measured 126K-token prefill go from
+   2,412 to 3,365 tok/s (**+39.5%**) on their 4-node setup. First pass at
+   this section assumed our production yaml leaves fabric selection to
+   bare auto-detection and might only be using one root -- **checked the
+   actual running container's env directly and that assumption was
+   wrong**: `NCCL_IB_HCA=rocep1s0f0,roceP2p1s0f0` (both HCAs explicitly
+   pinned) plus `NCCL_CROSS_NIC=1` (free ring formation across both NICs)
+   are already set in production. Also directly confirmed via `ethtool`
+   on both hosts that both ConnectX-7 cards' primary ports are physically
+   cabled and linked at 200Gb/s each (the secondary port on each card has
+   no cable) -- two real 200Gb/s links already exist between the nodes,
+   not one. sparkrun's "fabric-detected" launch step apparently generates
+   this dual-HCA pin automatically from the detected topology, rather
+   than leaving it to NCCL's own auto-selection as assumed. **This fleet
+   is very likely already getting whatever gain a second-root config
+   provides** -- mmastrac's win came from moving from one root to two;
+   this fleet appears to already run two. Downgraded from "top candidate,
+   worth a maintenance-window test" to "no action, already configured
+   this way" -- worth revisiting only if a future check finds a specific
+   NCCL channel/tuning difference beyond the root count itself.
+2. **Possible long-output repeat/skip claim -- spot-checked, clean, not
+   fully ruled out.** Their commit message states an empty
+   `<think></think>` (thinking off) "makes long output repeat or skip on
+   every checkpoint and stack, Hugging Face's reference implementation
+   included." This fork's own chat template also emits an empty
+   `<think></think>` when thinking is off (the same mechanism that
+   structurally prevents the reasoning-leak bug class, see
+   `reasoning_leak_confirmed_resolved_2026_09_24` -- a different symptom
+   than what was validated there). Sent a real 1200-max-token request
+   against production (`temperature=0`, a technical-explanation prompt
+   cut off cleanly at `finish_reason: length`) and checked programmatically
+   for degenerate repetition (repeated 8-word n-grams across the 813-word
+   output): **zero repeats found**, content read as normal, coherent
+   prose throughout. This is one spot-check, not exhaustive -- mmastrac's
+   description ("every checkpoint and stack") isn't fully specific about
+   trigger conditions, so this is "didn't reproduce on a reasonable
+   attempt," not "structurally impossible here." No action needed unless
+   a real report of this symptom shows up in our own traffic.
+
+**One new, actionable, zero-risk-to-try candidate**: MiaAI-Lab PR #251
+(merged today, 2026-09-25) adds `overlay/patch_loadclone.py` -- a
+topology-agnostic (TP2/TP3/TP4) lazy safetensors loader (file-backed mmap
++ `clone()`, bounded local-shard read-ahead). Defaults to
+`GLM53_LOAD_CLONE=1`, `GLM53_LOAD_PREFETCH=0` -- the read-ahead path is
+inert unless explicitly opted into, so adopting the file is a no-op until
+someone flips the prefetch flag. Unlike every other MiaAI-Lab candidate
+in recent rounds, this one is **not** gated to DFlash2 or TP=3 --
+genuinely applicable to our MTP-2/TP=2 setup. Doesn't touch decode/serving
+behavior (boot-time only), so not urgent, but worth a boot-time comparison
+in a future window. The PR's other half (a `patch_hybrid_prefix_hit.py`
+"fine-grained hits" fix) reinforces, rather than changes, the standing
+`reederey87_apc_patches_reviewed_2026_09_23` verdict -- same underlying
+gate (`mamba_cache_mode="align"` or a DFlash drafter KV group), still N/A.
+
+**Confirms prior conclusions, no action**: mmastrac/mentat (still Ray-
+replacement, still N/A, we use `mp`). tonyd2wild (active, pushed same day
+as our own DFlash2 test -- added `checkpoint_guard.py`, an NVFP4
+attention-block-corruption detector; NVFP4-specific, N/A since we run
+EXL3, worth remembering only if NVFP4 is ever reconsidered). AEON-7
+(quiet since 09-12, unchanged). cbertucci33 (still quiet since 09-20,
+5 days on from the last check with zero new activity -- the project may
+genuinely be dormant despite an "actively maintained" README claim).
+local-inference-lab/b12x (still PyPI 1.3.0, our CUDA-graph-capture arena
+workaround remains valid; one cosmetic internals-renaming commit, nothing
+functional). Entrpi (both repos confirmed quiet since 09-02 -- the vLLM
+fork's `pushed_at` ticked to 09-19 but with zero new commits, likely a
+non-content ref touch). r0b0tlab (one doc-only correction commit today,
+no code change; also a structurally different deployment -- single GB10
+TP=1, 2.25bpw -- not directly comparable to us anyway).
+
+**New, unreviewed repo name surfaced** (not yet added to the tracked
+list -- per this section's own stated policy, additions happen when the
+user names one): `gabewillen/GLM-5.3-Flash-EXL3-2x-DGX-Sparks`, cited by
+Enntity/sparkglm's 09-22 commit as the source of some NVMe-transport
+code they copied. Not triaged this round; flagging for a decision on
+whether to add it to rotation.
