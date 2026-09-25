@@ -3908,3 +3908,64 @@ ever reimaged or rebuilt from scratch, both the GRUB default fix and
 the systemd unit installation would need to be redone manually --
 worth keeping in mind, not currently automated as part of any
 provisioning flow.
+
+## Two production incidents, same day (2026-09-25)
+
+**Incident 1: unexplained clean shutdown, root cause NOT identified.**
+API server logged an orderly `[shutdown] API server: shutdown triggered`
+at 18:43:16 UTC with zero preceding warning/error/exception -- a normal
+SIGTERM-handling sequence (drain requests, stop EngineCore, close HTTP
+server), not a crash. Investigated thoroughly before restoring:
+- **Ruled out**: host reboot (uptime unchanged, both hosts up since
+  09-17), kernel change (still 7.0.0-1019 on both), earlyoom kill
+  (nothing in the journal in that window), new GPU/Xid fault (dmesg
+  clean at that exact timestamp, only pre-existing old entries), cron/
+  systemd timer on either host (checked both hosts' crontabs, cron.d,
+  and `systemctl list-timers` -- nothing scheduled near 18:43 UTC /
+  14:43 EDT).
+- **Notable but inconclusive**: `journalctl` on the head node returned
+  essentially nothing for the entire 18:00-19:00 UTC window (a single
+  "No entries" response even over a 3-hour query) -- consistent with a
+  plain `docker exec`/`kill`-style signal not generating journal
+  entries (not itself evidence of a cause), but also meant no journald-
+  level trail to follow.
+- **Not identified**: what actually sent the signal. The container
+  itself stayed "Up" throughout (only the internal server process
+  received the signal, not the container's PID 1) -- ruling out a
+  plain `sparkrun stop` (which tears down the whole container) as the
+  mechanism, though not ruling out something more targeted. No
+  further leads found with the tools available this session.
+- **Recovery**: `sparkrun stop` (confirmed a stale, still-CPU-spinning
+  worker process on the affected rank, cleanly torn down), preflight
+  checks clean on both hosts, relaunch -- ran straight into Incident 2
+  below before finally succeeding.
+
+**Incident 2: NCCL shm-broadcast stall, matches the already-tracked
+open upstream issue.** The relaunch attempt following Incident 1 hung
+partway through boot -- CUDA graph capture completed normally, but
+prefill graph capture stalled at 10/15 with one rank's GPU utilization
+pinned at 0% while the other sat at 96%, CPU still pegged on both
+ranks (confirmed not a simple hang/deadlock -- real CPU time was
+accumulating, consistent with `[shutdown]`-adjacent spin-wait, not a
+frozen process). After roughly 30 minutes of apparent progress-less
+CPU burn, the log finally surfaced the actual signature: `[shm_broadcast.py:801]
+No available shared memory broadcast block found in 60 seconds`. This
+is the exact, already-tracked open upstream issue (vLLM #51921, GB10/
+sm_121-specific -- see "Where to look for common problems" above),
+which per this project's own prior documentation does **not**
+self-resolve and requires stop + flush + retry. Applied the standard
+remedy: `sparkrun stop`, `prelaunch_flush.sh` (clean on both hosts),
+relaunch -- second attempt booted cleanly, validated with a real
+request, clean logs on both nodes. **This particular stall took ~30
+minutes of silent-looking CPU activity before its actual signature
+appeared in the log** -- worth remembering for next time this class of
+stall recurs: a boot that looks "still working" (real CPU time
+accumulating, no error yet) for an unusually long time, with one
+rank's GPU utilization stuck at 0%, is a stronger and earlier signal
+than waiting for the shm-broadcast log line itself to appear.
+
+**Final state**: production confirmed healthy, correct MTP-2 config,
+clean logs both nodes, validated with a real completion request. Two
+separate incidents in one session, only one with an identified,
+already-documented cause -- the first remains genuinely unexplained
+and worth watching for recurrence.
