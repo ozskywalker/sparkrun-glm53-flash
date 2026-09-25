@@ -3830,3 +3830,81 @@ user names one): `gabewillen/GLM-5.3-Flash-EXL3-2x-DGX-Sparks`, cited by
 Enntity/sparkglm's 09-22 commit as the source of some NVMe-transport
 code they copied. Not triaged this round; flagging for a decision on
 whether to add it to rotation.
+
+## Kernel pin fixed + boot-time auto-launch added (2026-09-25)
+
+Prompted by the user contemplating a regular reboot cadence for both
+hosts. Investigated two prerequisites first, both real gaps -- fixed
+both, host-level config plus one new tracked script.
+
+**Kernel pin was silently stale.** Both hosts are currently running
+`7.0.0-1019-nvidia` (confirmed stable in production for weeks,
+including through today's NCCL dual-rail verification), but GRUB's
+*persistent* default on both hosts was still `6.17.0-1032-nvidia` --
+the older kernel this project moved off of after an earlier
+unauthorized reboot (see `kernel_bump_7_0_0_1019_2026_09_17` in
+memory). No one-time `grub-reboot` override was active
+(`grub-editenv ... list` empty on both hosts) -- meaning the *next*
+reboot, and every one after it, would have silently reverted to
+6.17.0-1032 rather than staying on what's actually validated and
+running. Fixed on both hosts: updated `GRUB_DEFAULT` in
+`/etc/default/grub` to the `7.0.0-1019-nvidia` advanced-menu entry ID
+(the ID suffix differs per host -- each host's own machine-id, verified
+independently before editing) and ran `update-grub`, confirmed the
+regenerated `grub.cfg`'s `set default=` line on both hosts now points
+at 7.0.0-1019. `/etc/default/grub` backed up (`.bak.<date>`) on both
+hosts before editing. **Not yet tested against a real reboot** -- this
+is config-level verified (grub.cfg content confirmed correct), not
+boot-level verified, since production couldn't be interrupted to test.
+First actual reboot under the new cadence should be treated as the real
+validation of this fix, watched actively.
+
+**Containers had no restart-on-boot mechanism at all.** Confirmed via
+`docker inspect` on both hosts: `RestartPolicy.Name = "no"` on the
+running containers, and no systemd unit/cron/watchdog anywhere wired to
+relaunch `sparkrun` after a reboot (`docker.service` itself is enabled
+at boot, but that only brings the daemon up, not any specific
+container). Before this fix, a reboot meant production stayed down
+until someone manually reran the boot sequence.
+
+Added `recipes/scripts/glm53_boot_launch.sh` (git-tracked) + a systemd
+oneshot unit (`glm53-boot-launch.service`, host-level config, NOT
+git-tracked -- lives in `/etc/systemd/system/` on the worker host only,
+enabled via `systemctl enable`, currently inactive/dormant, confirmed
+it did not fire just from being enabled). Design, per explicit user
+request:
+- **180-second delay before doing anything**, specifically so a human
+  has a window to `systemctl stop glm53-boot-launch` and intervene
+  manually if a reboot lands the system in a bad state -- SIGTERM
+  during the sleep aborts cleanly, nothing has touched docker yet at
+  that point.
+- After the delay: bounded wait (up to 300s) for the head node's SSH to
+  actually be reachable, in case both hosts reboot together and the
+  head is still coming up.
+- Defensive cleanup of any stale `sparkrun_*` containers left in an
+  Exited state from before the reboot (they don't restart with
+  `RestartPolicy=no`, but they also don't disappear -- would otherwise
+  collide with the relaunch).
+- Then the standard sequence: `prelaunch_flush.sh` on both hosts,
+  backgrounded `sparkrun run` on the production yaml. Does not itself
+  wait for or validate health -- that's a separate concern, not this
+  service's job.
+- Lives only on the worker host (`127.0.0.1`) since that's where
+  `sparkrun run` has always been invoked from this whole engagement --
+  it orchestrates the head node over SSH, so the head node itself needs
+  no launcher unit, just to be up and reachable.
+
+**Not yet tested end-to-end** (would require an actual reboot, which
+wasn't done given live production traffic) -- unit file syntax verified
+via `systemd-analyze verify` (clean) and confirmed enabled-but-dormant.
+Recommend the first reboot under any new cadence be attended, watching
+`/var/log/glm53_boot_launch.log` and `sparkrun status`, before trusting
+this to run fully unattended on a schedule.
+
+**Caveat for future sessions/reimages**: the systemd unit and GRUB
+config are host-level state, not captured anywhere in this git repo
+(only `glm53_boot_launch.sh` itself is tracked). If either Spark is
+ever reimaged or rebuilt from scratch, both the GRUB default fix and
+the systemd unit installation would need to be redone manually --
+worth keeping in mind, not currently automated as part of any
+provisioning flow.
