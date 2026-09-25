@@ -1,4 +1,15 @@
-# Recipe: GLM-5.3-Flash EXL3 v20-upstreamsync (TP=2 across 2x DGX Spark, vLLM native multi-node)
+# Recipe: GLM-5.3-Flash EXL3 v21-b12xmoe (TP=2 across 2x DGX Spark, vLLM native multi-node)
+#
+# *** v21-b12xmoe PROMOTED (2026-09-19): identical to v20-upstreamsync
+# below except the container tag and the routed-expert MoE path, now the
+# b12x fused-trellis kernel (GLM53_EXL3_B12X_MOE=1) instead of this fork's
+# original per-expert/turboderp-exllamav3_ext path. Validated across
+# three separate GPU passes today (memory/zero-copy, correctness parity,
+# throughput) plus a direct real-traffic measurement of the one known
+# limitation (the SwiGLU clamp gap -- real but rare, accepted). See the
+# top-level `description:` field above and recipes/VALIDATION.md for full
+# context. Everything below this point is v20-upstreamsync's own header,
+# unchanged, since every fix it documents still applies identically here.
 #
 # *** CANDIDATE, NOT YET PROMOTED (2026-09-11) — v19-indexercompat remains
 # production while this is validated. Sourced from a routine upstream-check
@@ -662,12 +673,12 @@
 # `docker save | ssh <other-node> docker load`.
 
 recipe_version: "2"
-name: GLM-5.3-Flash-EXL3-v20-upstreamsync
-description: "Production (v20-upstreamsync). Routine upstream-check fixes on top of v19-indexercompat (chat template None-content leak, count_shards snapshot-scoping, long-prefill-threshold opt-in plumbing off, build-host memory guard) PLUS GLM53_DENSE_FP8=dense,kda on by default (2026-09-11 amendment) -- +14-17% decode, -15.6% prefill@64K, re-measured against this image and coherence-checked clean. For prefill-dominated workloads, use the sibling glm-5.3-flash-exl3-v20-upstreamsync-maxprefill-vllm.yaml instead (same image, dense-fp8 off). See recipes/VALIDATION.md."
+name: GLM-5.3-Flash-EXL3-v21-b12xmoe
+description: "PROMOTED (2026-09-19), production. Supersedes v20-upstreamsync. Identical to v20 except the routed-expert MoE path: replaces it with the b12x fused-trellis MoE (GLM53_EXL3_B12X_MOE=1) via a native [2,E,...] weight-layout change that makes the load genuinely zero-copy (measured 71 MiB/rank vs. an earlier, rejected post-load-adapter approach's 47.25 GiB/rank). Validated: 30/30 correctness parity cases (cosine 1.0) vs. this fork's own reference loop, near-parity-to-7%-faster throughput same-harness, and a direct real-traffic measurement of the one known limitation (b12x's correctness mode can't replicate this fork's +-10.0 SwiGLU clamp; measured real-world rate ~1-in-3.5M to 1-in-15M activations, accepted as a documented rare limitation, not a blocker). See recipes/VALIDATION.md's 'b12x fused-trellis MoE ... validated, v21-b12xmoe' and 'SwiGLU-clamp real-traffic measurement' sections for full background. Rollback target: v20-upstreamsync (GLM53_EXL3_B12X_MOE=1 simply unset restores the identical pre-b12x behavior on this same image family if needed, but the clean rollback is the v20 image itself)."
 
 model: Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw
 runtime: vllm
-container: glm53-exl3-v20-upstreamsync:local
+container: glm53-exl3-v21-b12xmoe:local
 
 min_nodes: 2
 
@@ -743,6 +754,20 @@ env:
   EXL3_FUSED_MOE: "1"
   GLM53_SUPPRESS_STOPS_IN_REASONING: "1"
   GLM53_MIXED_PREFILL_CHUNK: skip
+  # --- v21-b12xmoe PROMOTED (2026-09-19) ---
+  # GLM53_EXL3_B12X_MOE=1: the b12x fused-trellis MoE path, the whole
+  # point of this recipe, now on. Validated: 30/30 correctness parity
+  # (cosine 1.0) vs. this fork's own reference loop; memory zero-copy
+  # confirmed (data_ptr() equality, 71 MiB/rank vs. the rejected
+  # post-load-adapter approach's 47.25 GiB/rank); throughput near-parity-
+  # to-7%-faster same-harness vs. the real grouped-tier fused path;
+  # SwiGLU-clamp risk measured directly on real traffic and accepted as a
+  # documented, rare (~1-in-3.5M to 1-in-15M activations) limitation, not
+  # a blocker -- see recipes/VALIDATION.md's "SwiGLU-clamp real-traffic
+  # measurement" and "b12x fused-trellis MoE ... validated" sections.
+  # GLM53_EXL3_CLAMP_DIAG left off (default "0") -- its one job (measuring
+  # real-traffic clamp behavior) is done; no reason to carry it live.
+  GLM53_EXL3_B12X_MOE: "1"
   # --- NEW in v2: PR77 fat-expert prefill kernel ---
   # Tier E2 (direct + scatter CUDA kernel). Implies EXL3_FAT_BATCHED=1 and
   # EXL3_FAT_SORTED=1. Now the shipped default in upstream .env.example.
@@ -875,10 +900,24 @@ defaults:
   # / 1,250,457 tokens / 4.77x concurrency @ 262,144 tokens/request becomes
   # ~12.70 GiB / ~1.38M tokens / ~5.28x at 0.83 (+10.6%), costing back
   # ~1.22 GiB of the margin this fleet has twice been OOM-killed over.
-  # Unvalidated -- needs its own soak like every prior step on this line;
-  # watch node_0 (`10.7.0.87`, chronically the thinner-margin host) for a
-  # repeat of the earlyoom signature before calling this safe.
-  gpu_memory_utilization: 0.83
+  #
+  # Dropped 0.83 -> 0.82 (2026-09-20): the watch-for-a-repeat above found
+  # one. node_0 (10.7.0.87, the chronically thinner-margin host, as
+  # flagged) took two real earlyoom SIGTERM kills at 0.83 within the same
+  # ~3-hour window: first the API server process (19:11:40 UTC, badness
+  # 984, VmRSS 3353 MiB), then -- after a stop/flush/relaunch recovery --
+  # a Worker_TP process on the very next boot (17:55:00 local, badness
+  # 985, VmRSS 2367 MiB, plus a `kill failed: Timer expired` on top of
+  # it). Both during otherwise-idle/light real-request load (a
+  # concurrency sweep to max_num_seqs=16 shortly before the first kill is
+  # the likely proximate trigger, not a steady-state baseline problem,
+  # but the margin at 0.83 clearly cannot absorb it). Two kills on the
+  # same host in one afternoon is not "still on the knife-edge, not
+  # tipped over" -- it tipped. Reverting the 0.82->0.83 raise; 0.82 was
+  # already the last soaked-if-unvalidated value on this kernel before
+  # that raise. Re-raising to 0.83 again would need its own fresh
+  # justification and soak, not just "it was fine for a while."
+  gpu_memory_utilization: 0.82
   kv_cache_dtype: fp8
   # Raised 2048 -> 7168 (2026-09-02): matches upstream's own current
   # production value (discovered via the PR80 merge conflict in README.md

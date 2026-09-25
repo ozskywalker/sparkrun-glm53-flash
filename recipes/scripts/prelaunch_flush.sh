@@ -45,6 +45,22 @@ set -euo pipefail
 # fires on a genuinely depleted node, not routine variance.
 FRAG_WARN_THRESHOLD="${FRAG_WARN_THRESHOLD:-2000}"
 
+# Below this many free blocks at order-4 (64 KiB) or order-5 (128 KiB) in
+# zone Normal, warn and attempt a compaction pass. This is a SEPARATE check
+# from FRAG_WARN_THRESHOLD above -- found 2026-09-21 that the aggregate
+# above can read fine (hundreds of thousands+) while these two specific
+# orders individually collapse to ~1, which is exactly the pattern behind
+# 3 real earlyoom kills on the head node in one ~30 hour window (see
+# recipes/VALIDATION.md, "Root cause found: head-node-only medium-order
+# fragmentation"). Threshold chosen the same way as FRAG_WARN_THRESHOLD --
+# well above the observed-collapsed range (0-8, seen repeatedly) and well
+# below both the observed-healthy value (11,597-16,408 on the worker host)
+# and the value one manual compaction pass reached in testing (564-793).
+# Unvalidated against a large sample, same as FRAG_WARN_THRESHOLD originally
+# was -- revisit if it proves too noisy in practice.
+FRAG_MEDIUM_ORDER_WARN_THRESHOLD="${FRAG_MEDIUM_ORDER_WARN_THRESHOLD:-50}"
+GLM53_PREFLIGHT_SKIP_COMPACTION_FLUSHER="${GLM53_PREFLIGHT_SKIP_COMPACTION_FLUSHER:-0}"
+
 # This fork's shipped gpu_memory_utilization (v20-upstreamsync, both dense-FP8
 # and maxprefill sibling recipes) -- override if launching a recipe with a
 # different value. Headroom matches MiaAI-Lab's own default; both are
@@ -59,30 +75,67 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 check_fragmentation() {
   local host="$1"
-  local blocks blocks_after
+  local raw blocks order4 order5 raw_after blocks_after order4_after order5_after
+  local aggregate_ok=1 medium_ok=1
   scp -q -o BatchMode=yes "$SCRIPT_DIR/frag_check_remote.sh" "$host":/tmp/glm53_frag_check.sh
-  blocks="$(ssh -o BatchMode=yes "$host" 'bash /tmp/glm53_frag_check.sh' 2>/dev/null || echo "")"
-  if [ -z "$blocks" ]; then
-    echo "  fragmentation check: could not read nr_free_pages_blocks (unexpected /proc/zoneinfo format) — skipping"
+  raw="$(ssh -o BatchMode=yes "$host" 'bash /tmp/glm53_frag_check.sh' 2>/dev/null || echo "")"
+  blocks="$(echo "$raw" | sed -n '1p')"
+  order4="$(echo "$raw" | sed -n '2p' | awk '{print $1}')"
+  order5="$(echo "$raw" | sed -n '2p' | awk '{print $2}')"
+  if [ -z "$blocks" ] || [ -z "$order4" ] || [ -z "$order5" ]; then
+    echo "  fragmentation check: could not read /proc/zoneinfo or /proc/buddyinfo (unexpected format) — skipping"
     return
   fi
+
   if [ "$blocks" -ge "$FRAG_WARN_THRESHOLD" ]; then
     echo "  fragmentation check: $blocks contiguous free blocks in zone Normal (>= $FRAG_WARN_THRESHOLD, OK)"
+  else
+    aggregate_ok=0
+    echo "  WARNING: only $blocks contiguous free blocks in zone Normal (threshold $FRAG_WARN_THRESHOLD)."
+  fi
+
+  # Separate check: the aggregate above can look fine while these two
+  # specific orders individually collapse (see FRAG_MEDIUM_ORDER_WARN_
+  # THRESHOLD's own comment above) -- this is the actual pattern behind 3
+  # real earlyoom kills this project hit, which the aggregate check alone
+  # never caught.
+  if [ "$order4" -ge "$FRAG_MEDIUM_ORDER_WARN_THRESHOLD" ] && [ "$order5" -ge "$FRAG_MEDIUM_ORDER_WARN_THRESHOLD" ]; then
+    echo "  medium-order fragmentation check: order-4=$order4 order-5=$order5 free blocks (>= $FRAG_MEDIUM_ORDER_WARN_THRESHOLD each, OK)"
+  else
+    medium_ok=0
+    echo "  WARNING: order-4=$order4 order-5=$order5 free blocks in zone Normal (threshold $FRAG_MEDIUM_ORDER_WARN_THRESHOLD each)."
+    echo "           This is the head-node-only fragmentation pattern found 2026-09-21 (see"
+    echo "           recipes/VALIDATION.md) -- not caught by the aggregate check above, but directly"
+    echo "           behind 3 real earlyoom kills. A periodic compaction_flusher_remote.sh loop should"
+    echo "           already be running for the life of the job (started further down in this script)"
+    echo "           to keep re-compacting after this preflight pass; if kills recur despite that,"
+    echo "           the interval may need shortening (GLM53_COMPACTION_INTERVAL_SEC)."
+  fi
+
+  if [ "$aggregate_ok" -eq 1 ] && [ "$medium_ok" -eq 1 ]; then
     return
   fi
-  echo "  WARNING: only $blocks contiguous free blocks in zone Normal (threshold $FRAG_WARN_THRESHOLD)."
+
   echo "           This node may be fragmented enough to risk an NVRM NV_ERR_NO_MEMORY failure under"
   echo "           large-allocation pressure (long-context prefill soon after this boot, in particular)."
   echo "           Attempting a synchronous compaction pass..."
   ssh -o BatchMode=yes "$host" 'echo 1 | sudo -n tee /proc/sys/vm/compact_memory >/dev/null 2>&1' || true
-  blocks_after="$(ssh -o BatchMode=yes "$host" 'bash /tmp/glm53_frag_check.sh' 2>/dev/null || echo "$blocks")"
-  if [ "$blocks_after" -ge "$FRAG_WARN_THRESHOLD" ]; then
-    echo "  post-compaction: $blocks_after contiguous free blocks — above threshold, proceeding is more comfortable."
+  raw_after="$(ssh -o BatchMode=yes "$host" 'bash /tmp/glm53_frag_check.sh' 2>/dev/null || echo "")"
+  blocks_after="$(echo "$raw_after" | sed -n '1p')"
+  order4_after="$(echo "$raw_after" | sed -n '2p' | awk '{print $1}')"
+  order5_after="$(echo "$raw_after" | sed -n '2p' | awk '{print $2}')"
+  blocks_after="${blocks_after:-$blocks}"
+  order4_after="${order4_after:-$order4}"
+  order5_after="${order5_after:-$order5}"
+  echo "  post-compaction: aggregate=$blocks_after order-4=$order4_after order-5=$order5_after"
+  if [ "$blocks_after" -ge "$FRAG_WARN_THRESHOLD" ] && [ "$order4_after" -ge "$FRAG_MEDIUM_ORDER_WARN_THRESHOLD" ] && [ "$order5_after" -ge "$FRAG_MEDIUM_ORDER_WARN_THRESHOLD" ]; then
+    echo "  post-compaction: above both thresholds — proceeding is more comfortable."
   else
-    echo "  post-compaction: $blocks_after contiguous free blocks — still below threshold."
+    echo "  post-compaction: still below at least one threshold."
     echo "  WARNING: a boot right now carries elevated risk of the NVRM/Xid-31 failure class documented"
-    echo "           2026-09-08 (see recipes/VALIDATION.md). This is advisory, not a hard block — consider"
-    echo "           letting the node sit idle longer before a long-context boot, or proceed with awareness."
+    echo "           2026-09-08, and/or the earlyoom-kill pattern documented 2026-09-21 (see"
+    echo "           recipes/VALIDATION.md). This is advisory, not a hard block — consider letting the"
+    echo "           node sit idle longer before booting, or proceed with awareness."
   fi
 }
 
@@ -122,6 +175,22 @@ for host in "${HOST_LIST[@]}"; do
   check_fragmentation "$host"
   if [ "$GLM53_PREFLIGHT_SKIP_MEMORY_CHECK" != "1" ]; then
     check_memory_available "$host"
+  fi
+  if [ "$GLM53_PREFLIGHT_SKIP_COMPACTION_FLUSHER" != "1" ]; then
+    # Periodic (not just pre-launch) compaction -- see
+    # compaction_flusher_remote.sh's own header for the root cause this
+    # addresses (2026-09-21 head-node-only medium-order fragmentation
+    # finding). Unlike the cache flusher above, this is NOT gated behind
+    # --during-load: it needs to cover the whole serving lifetime, not
+    # just model load, since the fragmentation this targets develops
+    # within ~20 min of boot and can plausibly recur/continue afterward.
+    # Runs on every host passed in, not just whichever one turns out to be
+    # rank 0 -- this script doesn't know which host that is, and running
+    # it on the worker too is harmless (compaction is a no-op cost-wise
+    # when there's nothing to compact).
+    scp -q -o BatchMode=yes "$SCRIPT_DIR/compaction_flusher_remote.sh" "$host":/tmp/glm53_compaction_flusher.sh
+    ssh -o BatchMode=yes "$host" \
+      'cat /tmp/glm53_compaction_flusher.pid 2>/dev/null | xargs -r kill 2>/dev/null; nohup bash /tmp/glm53_compaction_flusher.sh "${GLM53_COMPACTION_INTERVAL_SEC:-300}" >/tmp/glm53_compaction_flusher_stdout.log 2>&1 & echo $! > /tmp/glm53_compaction_flusher.pid; echo "compaction flusher started pid $(cat /tmp/glm53_compaction_flusher.pid)"'
   fi
   if [ "$MODE" = "--during-load" ]; then
     scp -q -o BatchMode=yes "$SCRIPT_DIR/cache_flusher_remote.sh" "$host":/tmp/glm53_cache_flusher.sh

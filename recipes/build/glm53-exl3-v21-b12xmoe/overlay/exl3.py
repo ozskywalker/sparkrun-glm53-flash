@@ -39,6 +39,7 @@ import os
 import re
 import sys
 import types
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -119,7 +120,10 @@ def _initialize_tiny_dummy_exl3(layer: torch.nn.Module) -> None:
         # Give each expert and projection a distinct valid trellis pattern so
         # routing/expert-ID mistakes alter output tokens instead of hiding behind
         # identical dummy experts. Small scales keep the useless model finite.
-        experts = int(layer.w13_trellis.shape[0])
+        # v21-b12xmoe: w13_* is projection-major [2, E, ...] (b12x
+        # trellis_t256_proj layout, see create_weights) -- experts read off
+        # shape[1], not shape[0].
+        experts = int(layer.w13_trellis.shape[1])
         device = layer.w13_trellis.device
         expert = torch.arange(experts, dtype=torch.int32, device=device)
         w13_code = (expert[:, None] * 257 + torch.tensor(
@@ -127,16 +131,17 @@ def _initialize_tiny_dummy_exl3(layer: torch.nn.Module) -> None:
         )[None, :]) % 32767
         w2_code = (expert * 521 + 29) % 32767
         layer.w13_trellis.copy_(
-            w13_code.to(torch.int16).reshape(experts, 2, 1, 1, 1)
+            w13_code.t().contiguous().to(torch.int16).reshape(2, experts, 1, 1, 1)
         )
         layer.w2_trellis.copy_(
             w2_code.to(torch.int16).reshape(experts, 1, 1, 1)
         )
         scale = (1.0 + expert.to(torch.float32) / max(experts, 1)) / 128.0
         # Gate/up SUH remains shared, matching the production checkpoint and
-        # keeping the paired fat-expert path eligible.
-        layer.w13_suh.copy_(scale[:, None, None])
-        layer.w13_svh.copy_((scale * 0.75)[:, None, None])
+        # keeping the paired fat-expert path eligible. Broadcast targets the
+        # expert axis (now axis 1, not axis 0) -- see create_weights.
+        layer.w13_suh.copy_(scale[None, :, None])
+        layer.w13_svh.copy_((scale * 0.75)[None, :, None])
         layer.w2_suh.copy_((scale * 0.5)[:, None])
         layer.w2_svh.copy_((scale * 0.625)[:, None])
         layer.w13_mcg.fill_(MCG_MARKER_SIGNED_INT32)
@@ -244,6 +249,57 @@ _EXL3_FAT_DIAG: dict[str, Any] = {
 _FAT_SCRATCH_BYTES: dict[tuple, int] = {}
 _exl3_fat_tier_logged = False
 _exl3_decode_coop_logged = False
+
+# --- SwiGLU-clamp shadow diagnostic (v21-b12xmoe, 2026-09-18) ---
+# Answers a real open question from the b12x fused-trellis MoE validation:
+# b12x's full_rotation=True mode (needed for its numerics) cannot replicate
+# the +-SWIGLU_LIMIT_DEFAULT clamp this fork's existing kernels apply to
+# gate/up before SiLU. Does this checkpoint's real traffic ever actually
+# approach that clamp?
+#
+# This can NOT be answered by instrumenting the three Python-visible clamp
+# call sites (apply_exl3_python_loop, apply_exl3_sorted_fat,
+# apply_exl3_batched_fat) -- checked directly, and it turns out none of
+# them are what production actually runs. Production's real path
+# (EXL3_FAT_GROUPED=1, tier=grouped, confirmed via _exl3_fat_effective_tier
+# repeatedly this session) dispatches fat experts through
+# apply_exl3_grouped_fat, whose entire gate/up GEMM *and* SwiGLU activation
+# (clamp included) happen inside one opaque compiled kernel call
+# (ext.exl3_fat_moe_gateup) -- there is no Python-visible pre-clamp tensor
+# on that path. The non-fat "thin" path (_exl3_moe_launch, the majority of
+# tokens under normal routing) is equally opaque. Both are compiled CUDA;
+# neither exposes intermediate values without native code changes, which
+# is out of scope here.
+#
+# So this measures it a different way: a lightweight SHADOW computation,
+# gated behind GLM53_EXL3_CLAMP_DIAG=1, that runs alongside whichever real
+# path actually serves the request (fused/grouped/b12x/loop -- doesn't
+# matter which) and independently recomputes just gate=h@W_gate,
+# up=h@W_up for the same routed tokens (skipping SiLU, down-projection,
+# and output assembly -- the real result is never touched). Mathematically
+# this reproduces the SAME pre-clamp values the real path's kernel computes
+# internally, since it's the identical GEMM against the identical weights,
+# just via a Python-visible LinearEXL3 call. NOT free: this roughly
+# doubles the gate/up GEMM cost for every routed token while enabled --
+# a deliberate data-collection-window tool, never meant to run 24/7 in
+# real production traffic. Default off adds zero overhead (the sampler is
+# never invoked).
+EXL3_CLAMP_DIAG_LOG_EVERY = 200
+_EXL3_CLAMP_DIAG: dict[str, Any] = {
+    "enabled": False,
+    "calls": 0,
+    "total_values": 0,
+    "max_abs_gate": 0.0,
+    "max_abs_up": 0.0,
+    "exceed_gate_5": 0,
+    "exceed_gate_8": 0,
+    "exceed_gate_10": 0,
+    "exceed_gate_12": 0,
+    "exceed_up_5": 0,
+    "exceed_up_8": 0,
+    "exceed_up_10": 0,
+    "exceed_up_12": 0,
+}
 
 
 def decode_coop_enabled() -> bool:
@@ -1041,6 +1097,90 @@ def apply_exl3_python_loop(
         out.index_add_(0, token_idx, down * scale)
     return out
 
+
+def _exl3_clamp_diag_sample(
+    x2d: torch.Tensor,
+    ids: torch.Tensor,
+    weights: torch.Tensor,
+    inners: list[dict[str, Any]],
+    expert_map: torch.Tensor | None,
+) -> None:
+    """Shadow-recompute gate/up (no SiLU, no down, no output) for every
+    routed token, purely to sample this checkpoint's real pre-clamp
+    activation distribution. See the _EXL3_CLAMP_DIAG comment for why this
+    can't be read off the real serving path directly. Never touches `weights`
+    beyond routing -- output is discarded, real serving is unaffected."""
+    del weights
+    diag = _EXL3_CLAMP_DIAG
+    unique = torch.unique(ids)
+    max_gate = 0.0
+    max_up = 0.0
+    total = 0
+    exceed_gate = {5: 0, 8: 0, 10: 0, 12: 0}
+    exceed_up = {5: 0, 8: 0, 10: 0, 12: 0}
+    for raw in unique.tolist():
+        e_raw = int(raw)
+        if e_raw < 0:
+            continue
+        e = e_raw
+        if expert_map is not None:
+            mapped = int(expert_map[e].item()) if expert_map.numel() > e else e
+            if mapped < 0:
+                continue
+            e = mapped
+        if e >= len(inners):
+            continue
+        token_idx, _ = (ids == int(raw)).nonzero(as_tuple=True)
+        h = x2d.index_select(0, token_idx)
+        pack = inners[e]
+        gate = pack["gate"].forward(h.contiguous().half(), {}, out_dtype=torch.float32)
+        up = pack["up"].forward(h.contiguous().half(), {}, out_dtype=torch.float32)
+        gate_abs = gate.abs()
+        up_abs = up.abs()
+        max_gate = max(max_gate, float(gate_abs.max().item())) if gate_abs.numel() else max_gate
+        max_up = max(max_up, float(up_abs.max().item())) if up_abs.numel() else max_up
+        total += gate_abs.numel() + up_abs.numel()
+        for threshold in (5, 8, 10, 12):
+            exceed_gate[threshold] += int((gate_abs > threshold).sum().item())
+            exceed_up[threshold] += int((up_abs > threshold).sum().item())
+    diag["calls"] += 1
+    diag["total_values"] += total
+    diag["max_abs_gate"] = max(diag["max_abs_gate"], max_gate)
+    diag["max_abs_up"] = max(diag["max_abs_up"], max_up)
+    for threshold in (5, 8, 10, 12):
+        diag[f"exceed_gate_{threshold}"] += exceed_gate[threshold]
+        diag[f"exceed_up_{threshold}"] += exceed_up[threshold]
+    if diag["calls"] % EXL3_CLAMP_DIAG_LOG_EVERY == 0:
+        logger.info("exl3 clamp diag %s", _exl3_clamp_diag_line())
+
+
+def _exl3_clamp_diag_line() -> str:
+    d = _EXL3_CLAMP_DIAG
+    return " ".join(
+        [
+            f"calls={d['calls']}",
+            f"total_values={d['total_values']}",
+            f"max_abs_gate={d['max_abs_gate']:.4f}",
+            f"max_abs_up={d['max_abs_up']:.4f}",
+            "exceed_gate="
+            + ",".join(f">{t}:{d[f'exceed_gate_{t}']}" for t in (5, 8, 10, 12)),
+            "exceed_up="
+            + ",".join(f">{t}:{d[f'exceed_up_{t}']}" for t in (5, 8, 10, 12)),
+        ]
+    )
+
+
+def reset_exl3_clamp_diag_counters() -> None:
+    diag = _EXL3_CLAMP_DIAG
+    diag["calls"] = 0
+    diag["total_values"] = 0
+    diag["max_abs_gate"] = 0.0
+    diag["max_abs_up"] = 0.0
+    for threshold in (5, 8, 10, 12):
+        diag[f"exceed_gate_{threshold}"] = 0
+        diag[f"exceed_up_{threshold}"] = 0
+
+
 def apply_exl3_sorted_fat(
     xh: torch.Tensor,
     token_sorted: torch.Tensor,
@@ -1548,6 +1688,16 @@ def exl3_moe_fast_requested() -> bool:
     return raw == "1"
 
 
+def exl3_clamp_diag_enabled() -> bool:
+    """SwiGLU-clamp shadow diagnostic (default off, see the comment above
+    _EXL3_CLAMP_DIAG). Roughly doubles gate/up GEMM cost while on -- a
+    data-collection tool, not a production default."""
+    raw = os.environ.get("GLM53_EXL3_CLAMP_DIAG", "0")
+    if raw not in ("0", "1"):
+        raise RuntimeError("GLM53_EXL3_CLAMP_DIAG must be 0 or 1")
+    return raw == "1"
+
+
 def build_exl3_fused_state(layer: torch.nn.Module, inners: list[dict[str, Any]]) -> None:
     """Pointer tables + fused temps, once after load. No per-token alloc."""
     import exllamav3_ext
@@ -1675,6 +1825,486 @@ def build_exl3_fused_state(layer: torch.nn.Module, inners: list[dict[str, Any]])
                 scratch_mib,
             )
             _exl3_decode_coop_logged = True
+
+
+# ----------------------------------------------------------------------------
+# v21-b12xmoe: b12x fused-trellis MoE dispatch (opt-in, GLM53_EXL3_B12X_MOE=1).
+#
+# Zero-copy by construction: w13_trellis/w13_suh/w13_svh/w13_mcg are already
+# allocated projection-major ([2,E,...], see create_weights above) to match
+# b12x's own trellis_t256_proj storage exactly, so
+# prepare_trellis256_moe_weights() never has to reshape/copy the trellis
+# tensors -- confirmed at load time below via a data_ptr() equality assert,
+# not just assumed. Measured on real layer-10 checkpoint weights: new
+# steady-state residency ~71 MiB/rank total (the unavoidable
+# intermediate_rotations concat), vs. the 47.25 GiB/rank a post-load
+# black-box-adapter version of this same idea cost (see
+# b12x_moe_adapter_infeasible_2026_09_18 in this project's memory).
+#
+# KNOWN LIMITATION, not worked around: b12x's full_rotation=True mode (the
+# only mode that accepts EXL3's trellis_t256 prepared weights) REJECTS a
+# SwiGLU clamp outright -- "intermediate_rotation requires unclamped gated
+# silu or situ (no swiglu limit/oai)" is a real b12x kernel.py ValueError,
+# not a guess. This fork's own apply_exl3_python_loop / apply_exl3_fused_moe
+# both clamp gate/up to +-SWIGLU_LIMIT_DEFAULT (10.0) before SiLU; the b12x
+# path here does not and cannot apply that same clamp. Parity testing
+# (v21-b12xmoe's tests/test_exl3_overlay.py) confirms agreement across
+# realistic activation ranges where the clamp never triggers, but this is a
+# genuine, uncorrected semantic difference for out-of-range activations, not
+# a solved problem. `limit` is accepted for call-site signature symmetry
+# with the other two apply_* functions and is otherwise unused here.
+_B12X_PIN_VERSION = "1.3.0"
+_B12X_PREPARE_EXPECTED_PARAMS = {
+    "w13", "w2", "hidden_size", "intermediate_size", "num_experts",
+    "activation", "fc1_tile_n", "fc2_tile_n", "device", "seed",
+    "params_dtype", "w13_layout", "trellis_bits", "dummy_scale", "codebook",
+    "gate_suh", "up_suh", "intermediate_rotations", "down_svh",
+    "tile_config", "workspace",
+}
+
+
+def exl3_b12x_moe_requested() -> bool:
+    """Opt-in b12x fused-trellis MoE dispatch (default off).
+
+    Mirrors exl3_moe_fast_requested's validation: anything other than 0/1
+    raises at load instead of surfacing as a confusing failure on the first
+    decode call.
+    """
+    raw = os.environ.get("GLM53_EXL3_B12X_MOE", "0")
+    if raw not in ("0", "1"):
+        raise RuntimeError("GLM53_EXL3_B12X_MOE must be 0 or 1")
+    return raw == "1"
+
+
+def _verify_b12x_pin():
+    """Fail closed on a b12x version/signature drift, not silently.
+
+    prepare_trellis256_moe_weights lives in b12x's PRIVATE
+    b12x.moe._shared.kernels.w4a16.prepare module (not the public
+    b12x.moe.fused_moe.api, which is for b12x's own atoms/rate format, not
+    EXL3's trellis_t256 -- b12x's own fused_moe/trellis.py imports the same
+    private path for the same reason). A version bump could silently change
+    this function's parameter names/semantics; assert the pin and the
+    expected signature explicitly rather than discovering a mismatch as a
+    confusing runtime error mid-decode.
+    """
+    import inspect
+
+    import b12x
+
+    installed = getattr(b12x, "__version__", None)
+    if installed is not None and installed != _B12X_PIN_VERSION:
+        raise RuntimeError(
+            f"GLM53_EXL3_B12X_MOE=1 requires b12x=={_B12X_PIN_VERSION}, "
+            f"found {installed!r} -- re-verify prepare_trellis256_moe_weights's "
+            "signature and the w13_layout='trellis_t256_proj' contract "
+            "against the new version before bumping this pin"
+        )
+    from b12x.moe._shared.kernels.w4a16.prepare import prepare_trellis256_moe_weights
+
+    actual_params = set(inspect.signature(prepare_trellis256_moe_weights).parameters)
+    if not _B12X_PREPARE_EXPECTED_PARAMS.issubset(actual_params):
+        missing = _B12X_PREPARE_EXPECTED_PARAMS - actual_params
+        raise RuntimeError(
+            "GLM53_EXL3_B12X_MOE=1: b12x.moe._shared.kernels.w4a16.prepare."
+            f"prepare_trellis256_moe_weights is missing expected parameter(s) "
+            f"{sorted(missing)} -- signature drift, re-verify against b12x "
+            f"source before proceeding (installed version: {installed!r})"
+        )
+    return prepare_trellis256_moe_weights
+
+
+def build_b12x_prepared_state(layer: torch.nn.Module) -> None:
+    """Build layer._b12x_prepared once after load. Fail closed on any mismatch.
+
+    Requires the projection-major w13_* layout from create_weights above.
+    Verifies the central zero-copy thesis with a real data_ptr() equality
+    assert, not just trusting b12x's "no bytes copied" docstring claim.
+    """
+    prepare_trellis256_moe_weights = _verify_b12x_pin()
+
+    hidden = int(layer._exl3_hidden_size)
+    intermediate = int(layer._exl3_intermediate_local)
+    device = layer.w13_trellis.device
+    num_experts = int(layer.w13_trellis.shape[1])  # [2, E, ...] -- projection-major
+
+    gate_svh = layer.w13_svh[0].contiguous()
+    up_svh = layer.w13_svh[1].contiguous()
+    down_suh = layer.w2_suh.contiguous()
+    # Order is [gate_svh, up_svh, down_suh], per-expert-interleaved (dim=1,
+    # giving [E, 3*intermediate]) -- confirmed against b12x source
+    # (prepare.py's own rotation-order comment) and empirically: a 6-way
+    # permutation sweep in this recipe's tests found this ordering matches
+    # apply_exl3_python_loop's reference output (cos>=0.999999) while moving
+    # gate_svh out of position 0 collapses agreement to cos~0.64-0.79. (Note:
+    # swapping positions 1/2 -- up_svh vs down_suh -- was NOT independently
+    # discriminating on this checkpoint's real data at the standard tolerance
+    # because down_suh's real values are naturally ~65x smaller in magnitude
+    # than up_svh's; a follow-up adversarial test with down_suh artificially
+    # scaled to up_svh's magnitude still showed only a small, non-bit-identical
+    # difference between the two orders (maxabs ~0.007 on outputs ~0.1-0.3),
+    # confirming the position is genuinely low-sensitivity for this model
+    # rather than a test bug -- the ordering used here is the one the b12x
+    # source states is correct, not merely the one that happened to pass.)
+    intermediate_rotations = torch.cat([gate_svh, up_svh, down_suh], dim=1).contiguous()
+
+    prepared = prepare_trellis256_moe_weights(
+        layer.w13_trellis, layer.w2_trellis,
+        hidden_size=hidden,
+        intermediate_size=intermediate,
+        num_experts=num_experts,
+        activation="silu",
+        fc1_tile_n=256,
+        fc2_tile_n=256,
+        device=device,
+        params_dtype=torch.float16,
+        w13_layout="trellis_t256_proj",
+        trellis_bits=int(layer._exl3_bits),
+        codebook="mcg",
+        gate_suh=layer.w13_suh[0].contiguous(),
+        up_suh=layer.w13_suh[1].contiguous(),
+        intermediate_rotations=intermediate_rotations,
+        down_svh=layer.w2_svh.contiguous(),
+    )
+    if prepared.w13.data_ptr() != layer.w13_trellis.data_ptr():
+        raise RuntimeError(
+            "GLM53_EXL3_B12X_MOE=1: b12x's prepared w13 is not a zero-copy "
+            "view of this layer's w13_trellis -- the central premise of this "
+            "integration (projection-major allocation matching b12x's "
+            "trellis_t256_proj layout) does not hold on this b12x build; "
+            "refusing to proceed rather than silently eat the multi-GiB copy "
+            "this design exists to avoid"
+        )
+    if prepared.w2.data_ptr() != layer.w2_trellis.data_ptr():
+        raise RuntimeError(
+            "GLM53_EXL3_B12X_MOE=1: b12x's prepared w2 is not a zero-copy "
+            "view of this layer's w2_trellis"
+        )
+    layer._b12x_prepared = prepared
+    layer._b12x_num_experts = num_experts
+
+    # Build (or reuse, if another layer already built one for the same
+    # shape) the fixed-capacity scratch arena NOW, at load time -- long
+    # before any CUDA graph capture, for either the main model's own
+    # captures or the MTP speculator's. See _b12x_arena_for's docstring for
+    # why this must never be built lazily on first apply-time use.
+    topk, m_max = _b12x_topk_and_m_max_from_vllm_config()
+    layer._b12x_topk = topk
+    _b12x_arena_for(prepared, device, hidden, intermediate, num_experts, topk, m_max)
+
+
+def _b12x_topk_and_m_max_from_vllm_config() -> tuple[int, int]:
+    """(num_experts_per_tok, max_num_batched_tokens) from the live vLLM config.
+
+    Both are fixed, load-time-known constants (a model architecture constant
+    and a scheduler config value), not request-varying -- so unlike
+    _glm53_layer_types elsewhere in this file, there is no safe default to
+    degrade to on failure. An arena sized from a wrong/guessed value here is
+    a silent-corruption risk (an undersized buffer), not a crash, so this
+    raises loudly rather than swallowing the exception.
+    """
+    from vllm.config import get_current_vllm_config
+
+    cfg = get_current_vllm_config()
+    topk = getattr(cfg.model_config.hf_text_config, "num_experts_per_tok", None)
+    m_max = getattr(cfg.scheduler_config, "max_num_batched_tokens", None)
+    if topk is None or m_max is None:
+        raise RuntimeError(
+            "GLM53_EXL3_B12X_MOE=1: could not read num_experts_per_tok "
+            f"({topk!r}) and/or max_num_batched_tokens ({m_max!r}) from the "
+            "live vLLM config -- refusing to guess a b12x scratch-arena size "
+            "from a default, since an undersized arena is a silent memory-"
+            "corruption risk, not a crash"
+        )
+    return int(topk), int(m_max)
+
+
+@dataclass
+class _B12XArena:
+    """One fixed-capacity scratch arena, shared across every MoE layer with
+    matching (device, hidden, intermediate, num_experts, topk) -- including
+    both the main model's routed-expert layers and the MTP speculator's
+    (Glm5NextMTP builds its MoE layer from the same Glm5NextMoE class, so it
+    shares this key in practice). Mirrors _FUSED_TEMP_CACHE's existing
+    pattern: sized once for the worst case, at load time, so no torch.empty()
+    ever happens again on the apply path -- provably cannot be a CUDA-graph-
+    capture-time allocation because there is exactly one allocation, ever,
+    made outside of any capture context (build_b12x_prepared_state runs
+    during process_weights_after_loading, unconditionally before any graph
+    capture for either the main model or the speculator).
+    """
+
+    m_max: int
+    topk: int
+    num_experts: int
+    hidden: int
+    intermediate: int
+    sms: int
+    coupled_hadamard: bool
+    intermediate_cache13: torch.Tensor
+    intermediate_cache2: torch.Tensor
+    output: torch.Tensor
+    fc1_c_tmp: torch.Tensor
+    fc2_c_tmp: torch.Tensor
+    packed_route_indices: torch.Tensor
+    block_expert_ids: torch.Tensor
+    packed_route_count: torch.Tensor
+    expert_offsets: torch.Tensor
+    expert_counts: torch.Tensor
+    rotation_a_gate: torch.Tensor
+    rotation_a_up: torch.Tensor
+
+
+_B12X_ARENA_CACHE: dict[tuple, _B12XArena] = {}
+
+
+def _b12x_build_arena(prepared, device: torch.device, hidden: int, intermediate: int,
+                       num_experts: int, topk: int, m_max: int) -> _B12XArena:
+    """Size one arena for the worst case across every m in [1, m_max].
+
+    Uses b12x's own plan_w4a16_buffers as the authoritative sizing source --
+    an exhaustive sweep over every m, not a hand-derived formula or a
+    monotonicity assumption (block_size_m's bucket selection and the
+    sms-based min() cap in packed_gemm_scratch_elements make several of
+    these fields non-obviously monotonic in m; measuring every value is
+    cheap -- pure host-side Python arithmetic, no GPU ops -- and removes any
+    risk of an off-by-one that under-sizes a buffer, which would be a silent
+    corruption risk rather than a crash).
+    """
+    from b12x.moe._shared.kernels.w4a16.host import plan_w4a16_buffers
+
+    sms = int(torch.cuda.get_device_properties(device).multi_processor_count)
+    max_route_slots = 0
+    max_route_blocks = 0
+    max_fc1_c_tmp = 0
+    max_fc2_c_tmp = 0
+    max_cache13 = 0
+    max_cache2 = 0
+    max_rotation = 0
+    for m in range(1, int(m_max) + 1):
+        plan = plan_w4a16_buffers(
+            prepared, m=m, topk=topk, route_num_experts=num_experts, sms=sms,
+            full_rotation=True, block_size_m=None,
+        )
+        max_route_slots = max(max_route_slots, plan.route_slots)
+        max_route_blocks = max(max_route_blocks, plan.route_blocks)
+        max_fc1_c_tmp = max(max_fc1_c_tmp, plan.fc1_c_tmp_elements)
+        max_fc2_c_tmp = max(max_fc2_c_tmp, plan.fc2_c_tmp_elements)
+        max_cache13 = max(max_cache13, plan.intermediate_cache13_elements)
+        max_cache2 = max(max_cache2, plan.intermediate_cache2_elements)
+        max_rotation = max(max_rotation, plan.rotation_a_elements)
+
+    coupled_hadamard = bool(getattr(prepared, "coupled_hadamard", False))
+    max_output_elements = int(m_max) * int(hidden)
+
+    rotation_a_gate = torch.empty((max(max_rotation, 1),), dtype=torch.float16, device=device)
+    rotation_a_up = (
+        rotation_a_gate
+        if coupled_hadamard
+        else torch.empty((max(max_rotation, 1),), dtype=torch.float16, device=device)
+    )
+
+    return _B12XArena(
+        m_max=int(m_max),
+        topk=int(topk),
+        num_experts=int(num_experts),
+        hidden=int(hidden),
+        intermediate=int(intermediate),
+        sms=sms,
+        coupled_hadamard=coupled_hadamard,
+        intermediate_cache13=torch.empty(
+            (max(max_cache13, 1),), dtype=torch.float16, device=device
+        ),
+        intermediate_cache2=torch.empty(
+            (max(max_cache2, 1),), dtype=torch.float16, device=device
+        ),
+        output=torch.empty((max(max_output_elements, 1),), dtype=torch.float32, device=device),
+        fc1_c_tmp=torch.empty((max(max_fc1_c_tmp, 1),), dtype=torch.float32, device=device),
+        fc2_c_tmp=torch.empty((max(max_fc2_c_tmp, 1),), dtype=torch.float32, device=device),
+        packed_route_indices=torch.empty(
+            (max(max_route_slots, 1),), dtype=torch.int32, device=device
+        ),
+        block_expert_ids=torch.empty(
+            (max(max_route_blocks, 1),), dtype=torch.int32, device=device
+        ),
+        packed_route_count=torch.empty((1,), dtype=torch.int32, device=device),
+        expert_offsets=torch.empty((num_experts + 1,), dtype=torch.int32, device=device),
+        expert_counts=torch.empty((num_experts,), dtype=torch.int32, device=device),
+        rotation_a_gate=rotation_a_gate,
+        rotation_a_up=rotation_a_up,
+    )
+
+
+def _b12x_arena_for(prepared, device: torch.device, hidden: int, intermediate: int,
+                     num_experts: int, topk: int, m_max: int | None = None) -> _B12XArena:
+    """Get (building once if needed) the shared arena for this shape.
+
+    Called eagerly from build_b12x_prepared_state at load time (m_max
+    provided) so the cache is always warm by the time apply_exl3_b12x_moe
+    runs. The is_current_stream_capturing() branch below is defense in
+    depth, not the primary safety mechanism -- it should never fire given
+    the eager-build-at-load-time design, but if some future code path
+    reaches this cold during capture anyway, fail loudly rather than
+    silently allocate (reintroducing the exact bug this arena exists to
+    close) or silently fall back to a different numerical path (which would
+    permanently and invisibly downgrade that graph's MoE tier forever, the
+    same blind-spot class this fork already got burned by once this week).
+    """
+    key = (str(device), hidden, intermediate, num_experts, topk)
+    arena = _B12X_ARENA_CACHE.get(key)
+    if arena is not None:
+        return arena
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            "GLM53_EXL3_B12X_MOE=1: b12x scratch arena was never built before "
+            "CUDA graph capture reached this layer shape "
+            f"{key} -- build_b12x_prepared_state() must build it during "
+            "process_weights_after_loading, well before any capture. "
+            "Refusing to allocate scratch memory mid-capture."
+        )
+    if m_max is None:
+        raise RuntimeError(
+            "GLM53_EXL3_B12X_MOE=1: no b12x scratch arena exists yet for "
+            f"layer shape {key} and no m_max was provided to build one -- "
+            "this should only ever be reached from build_b12x_prepared_state, "
+            "not from a bare apply-time lookup"
+        )
+    arena = _b12x_build_arena(prepared, device, hidden, intermediate, num_experts, topk, m_max)
+    _B12X_ARENA_CACHE[key] = arena
+    return arena
+
+
+def apply_exl3_b12x_moe(
+    x2d: torch.Tensor,
+    ids: torch.Tensor,
+    weights: torch.Tensor,
+    layer: torch.nn.Module,
+    inners: list[dict[str, Any]],
+    expert_map: torch.Tensor | None,
+    limit: float,
+) -> torch.Tensor:
+    """b12x fused-trellis MoE apply. See the module comment above this section
+    for the zero-copy design and the known SwiGLU-clamp limitation. `inners`
+    and `expert_map` are accepted for call-site symmetry with
+    apply_exl3_fused_moe/apply_exl3_python_loop but unused: b12x dispatches
+    from layer._b12x_prepared directly, and this integration does not yet
+    support TP expert-parallelism remapping (`expert_map`) -- see
+    grouped_fat_eligibility-style checks for the pattern to extend this if
+    that's ever needed.
+    """
+    del inners, limit
+    from b12x.moe._shared.kernels.w4a16.host import plan_w4a16_buffers
+    from b12x.moe._shared.kernels.w4a16.route_pack import pack_topk_routes_by_expert
+    from b12x.moe._shared.kernels.w4a16.kernel import run_w4a16_moe
+
+    prepared = getattr(layer, "_b12x_prepared", None)
+    if prepared is None:
+        raise RuntimeError(
+            "GLM53_EXL3_B12X_MOE=1 but layer._b12x_prepared was never built "
+            "-- build_b12x_prepared_state() must run in "
+            "process_weights_after_loading before this is called"
+        )
+    if expert_map is not None:
+        raise RuntimeError(
+            "GLM53_EXL3_B12X_MOE=1 does not support expert-parallel "
+            "expert_map remapping yet"
+        )
+    device = x2d.device
+    hidden = int(layer._exl3_hidden_size)
+    intermediate = int(layer._exl3_intermediate_local)
+    num_experts = int(layer._b12x_num_experts)
+    m = int(ids.shape[0])
+    topk = int(ids.shape[-1])
+    expected_topk = int(layer._b12x_topk)
+    if topk != expected_topk:
+        raise RuntimeError(
+            f"GLM53_EXL3_B12X_MOE=1: this call's topk ({topk}) does not match "
+            f"the model-constant topk ({expected_topk}) the scratch arena was "
+            "sized for at load time -- the arena's worst-case sizing assumed "
+            "a fixed topk, so proceeding could silently overflow a buffer"
+        )
+
+    # Fixed-capacity arena, built once at load time (build_b12x_prepared_state)
+    # -- no torch.empty() happens on this path, ever, so this is safe to call
+    # from inside CUDA graph capture (both the main model's and the MTP
+    # speculator's), unlike the m-keyed lazy-allocation design this replaced.
+    arena = _b12x_arena_for(prepared, device, hidden, intermediate, num_experts, topk)
+    if m > arena.m_max:
+        raise RuntimeError(
+            f"GLM53_EXL3_B12X_MOE=1: this call's m ({m}) exceeds the scratch "
+            f"arena's swept worst case (m_max={arena.m_max}, taken from "
+            "max_num_batched_tokens at load time) -- refusing to silently "
+            "allocate a bigger buffer, which would reintroduce the exact "
+            "CUDA-graph-capture-time-allocation bug this arena exists to "
+            "prevent; re-check max_num_batched_tokens against real traffic"
+        )
+
+    a_input = x2d.contiguous().half()
+    topk_ids = ids.reshape(m, topk).to(torch.int32).contiguous()
+    topk_weights = weights.reshape(m, topk).to(torch.float32).contiguous()
+
+    plan = plan_w4a16_buffers(
+        prepared, m=m, topk=topk, route_num_experts=num_experts, sms=arena.sms,
+        full_rotation=True, block_size_m=None,
+    )
+    block_size_m = plan.block_size_m
+
+    intermediate_cache13 = arena.intermediate_cache13.narrow(
+        0, 0, plan.intermediate_cache13_elements
+    )
+    intermediate_cache2 = arena.intermediate_cache2.narrow(
+        0, 0, plan.intermediate_cache2_elements
+    ).view(plan.routed_rows, intermediate)
+    output = arena.output.narrow(0, 0, m * hidden).view(m, hidden)
+    fc1_c_tmp = arena.fc1_c_tmp.narrow(0, 0, plan.fc1_c_tmp_elements)
+    fc2_c_tmp = arena.fc2_c_tmp.narrow(0, 0, plan.fc2_c_tmp_elements)
+    packed_route_indices = arena.packed_route_indices.narrow(0, 0, plan.route_slots)
+    block_expert_ids = arena.block_expert_ids.narrow(0, 0, plan.route_blocks)
+    rotation_a_gate = arena.rotation_a_gate.narrow(0, 0, plan.rotation_a_elements).view(
+        plan.routed_rows, hidden
+    )
+    rotation_a_up = (
+        rotation_a_gate
+        if arena.coupled_hadamard
+        else arena.rotation_a_up.narrow(0, 0, plan.rotation_a_elements).view(
+            plan.routed_rows, hidden
+        )
+    )
+
+    pack_topk_routes_by_expert(
+        topk_ids, block_size_m, num_experts,
+        packed_route_indices=packed_route_indices,
+        block_expert_ids=block_expert_ids,
+        packed_route_count=arena.packed_route_count,
+        expert_offsets=arena.expert_offsets,
+        expert_counts=arena.expert_counts,
+    )
+    out = run_w4a16_moe(
+        a_input, prepared, topk_weights, topk_ids,
+        activation="silu",
+        intermediate_cache13=intermediate_cache13,
+        intermediate_cache2=intermediate_cache2,
+        output=output,
+        fc1_c_tmp=fc1_c_tmp,
+        fc2_c_tmp=fc2_c_tmp,
+        packed_route_indices=packed_route_indices,
+        block_expert_ids=block_expert_ids,
+        packed_route_count=arena.packed_route_count,
+        expert_offsets=arena.expert_offsets,
+        expert_counts=arena.expert_counts,
+        expert_map=None,
+        output_expert_map=None,
+        full_rotation=True,
+        suh_gate_table=prepared.gate_suh,
+        suh_up_table=prepared.up_suh,
+        svh_table=prepared.down_svh,
+        intermediate_rotation_scales=prepared.intermediate_rotations,
+        rotation_a_gate=rotation_a_gate,
+        rotation_a_up=rotation_a_up,
+        route_block_size_m=block_size_m,
+    )
+    return out
+# ----------------------------------------------------------------------------
 
 
 def _exl3_moe_launch(
@@ -2101,6 +2731,27 @@ def apply_exl3_experts(
     ids = topk_ids.reshape(tokens, -1).to(torch.long)
     weights = topk_weights.reshape(tokens, -1)
     expert_map = pin_exl3_expert_map(layer, x2d.device)
+    if exl3_clamp_diag_enabled() and not torch.cuda.is_current_stream_capturing():
+        # Fixed 2026-09-19: this fork's CUDA-graph warmup/capture phase runs
+        # a real forward pass with synthetic dummy data through this exact
+        # code path before any real request is ever served. The diagnostic's
+        # torch.unique(ids) call (and everything downstream of it) requires
+        # a host sync, which CUDA explicitly forbids while a stream is
+        # capturing ("operation not permitted when stream is capturing" --
+        # crashed both ranks on first deploy). Skipping during capture is
+        # also the right behavior independent of the crash: capture uses
+        # synthetic data, not real traffic, so sampling it would pollute the
+        # very statistic this diagnostic exists to measure.
+        _EXL3_CLAMP_DIAG["enabled"] = True
+        _exl3_clamp_diag_sample(x2d, ids, weights, inners, expert_map)
+    if exl3_b12x_moe_requested():
+        # Fail closed: requested-but-not-built means process_weights_after_
+        # loading either never ran this path or its own fail-closed check
+        # already raised -- apply_exl3_b12x_moe raises with a clear message
+        # rather than silently falling through to the loop/fused path below.
+        out = apply_exl3_b12x_moe(x2d, ids, weights, layer, inners, expert_map, limit)
+        layer._exl3_last_apply = "b12x"
+        return out.to(dtype=x.dtype)
     have_ptrs = bool(getattr(layer, "_exl3_ptrs", None))
     if fused is True and not have_ptrs:
         raise RuntimeError("EXL3 fused apply requested but pointer tables are missing")
@@ -2378,26 +3029,37 @@ class Exl3MoEMethod(FusedMoEMethodBase):
 
         extra = {k: v for k, v in extra_weight_attrs.items() if k != "weight_loader"}
 
-        # w13_* : stacked [expert, {gate=0, up=1}, ...] so the stock
-        # expert_params_mapping (experts.w13_ + suffix) hits these names.
+        # w13_* : stacked [{gate=0, up=1}, expert, ...] -- PROJECTION-MAJOR,
+        # not expert-major. v21-b12xmoe change: b12x's
+        # prepare_trellis256_moe_weights(w13_layout="trellis_t256_proj")
+        # requires exactly this [2, E, ...] backing (see
+        # b12x/moe/_shared/kernels/w4a16/prepare.py's docstring) so the
+        # existing per-expert incremental weight_loader (_load_exl3) writes
+        # b12x's desired contiguous layout directly -- zero extra copy at
+        # fused-MoE prepare time. The stock expert_params_mapping still
+        # hits these names by string ("experts.w13_" + suffix); it never
+        # reads the parameter's shape, only its registered name (verified
+        # against vllm/model_executor/layers/fused_moe/layer.py: num_experts
+        # flows top-down as a constructor arg, never inferred from a
+        # parameter's shape).
         w13_trellis = Parameter(
             torch.empty(
-                num_experts, 2, in_tiles, out_tiles, k_words, dtype=torch.int16
+                2, num_experts, in_tiles, out_tiles, k_words, dtype=torch.int16
             ),
             requires_grad=False,
         )
         w13_suh = Parameter(
-            torch.empty(num_experts, 2, hidden_size, dtype=torch.float16),
+            torch.empty(2, num_experts, hidden_size, dtype=torch.float16),
             requires_grad=False,
         )
         w13_svh = Parameter(
             torch.empty(
-                num_experts, 2, intermediate_size_per_partition, dtype=torch.float16
+                2, num_experts, intermediate_size_per_partition, dtype=torch.float16
             ),
             requires_grad=False,
         )
         w13_mcg = Parameter(
-            torch.empty(num_experts, 2, 1, dtype=torch.int32),
+            torch.empty(2, num_experts, 1, dtype=torch.int32),
             requires_grad=False,
         )
         w2_trellis = Parameter(
@@ -2478,7 +3140,9 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         if shard_id in ("w1", "w3"):
             shard_idx = 0 if shard_id == "w1" else 1
             sharded = shard_exl3_col(loaded, suffix, tp_rank, tp_size)
-            dest = param.data[expert_id, shard_idx]
+            # v21-b12xmoe: w13_* is [2, E, ...] (projection-major), not
+            # [E, 2, ...] -- see create_weights.
+            dest = param.data[shard_idx, expert_id]
         elif shard_id == "w2":
             sharded = shard_exl3_row(loaded, suffix, tp_rank, tp_size)
             dest = param.data[expert_id]
@@ -2521,23 +3185,25 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 f"{MCG_MARKER_SIGNED_INT32}; packed ABI mismatch"
             )
 
-        n_exp = int(layer.w13_trellis.shape[0])
+        # v21-b12xmoe: w13_* is [2, E, ...] (projection-major) -- experts
+        # read off shape[1], and gate/up selection is [0]/[1] on axis 0.
+        n_exp = int(layer.w13_trellis.shape[1])
         layer._exl3_shared_w13_suh = bool(
-            torch.equal(layer.w13_suh[:, 0], layer.w13_suh[:, 1])
+            torch.equal(layer.w13_suh[0], layer.w13_suh[1])
         )
         inners: list[dict[str, Any]] = []
         for e in range(n_exp):
             gate = make_linear_exl3(
-                layer.w13_trellis[e, 0],
-                layer.w13_suh[e, 0],
-                layer.w13_svh[e, 0],
-                layer.w13_mcg[e, 0],
+                layer.w13_trellis[0, e],
+                layer.w13_suh[0, e],
+                layer.w13_svh[0, e],
+                layer.w13_mcg[0, e],
             )
             up = make_linear_exl3(
-                layer.w13_trellis[e, 1],
-                layer.w13_suh[e, 1],
-                layer.w13_svh[e, 1],
-                layer.w13_mcg[e, 1],
+                layer.w13_trellis[1, e],
+                layer.w13_suh[1, e],
+                layer.w13_svh[1, e],
+                layer.w13_mcg[1, e],
             )
             down = make_linear_exl3(
                 layer.w2_trellis[e],
@@ -2575,6 +3241,12 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 "image built with overlay/patch_exl3_decode_pipeline.py; "
                 f"load-time setup failed: {fused_err or 'EXL3_FUSED_MOE=0'}"
             )
+        if exl3_b12x_moe_requested():
+            # Fail closed: build_b12x_prepared_state itself raises on a
+            # missing/mismatched b12x install or a broken zero-copy
+            # invariant -- never caught here, so a requested-but-broken b12x
+            # path surfaces at load time, not as a confusing failure mid-decode.
+            build_b12x_prepared_state(layer)
         if not self._logged:
             if fused_ok:
                 logger.info(

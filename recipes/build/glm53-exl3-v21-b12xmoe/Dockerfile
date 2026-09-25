@@ -648,6 +648,20 @@ RUN set -eux; \
     python3 -c "import torch; import exllamav3_ext; syms = ['exl3_moe', 'exl3_fat_gemm', 'exl3_fat_gemm_scatter', 'exl3_fat_gemm_m64', 'exl3_fat_gemm_pair', 'exl3_fat_gemm_pair_m64', 'exl3_fat_swiglu_had', 'exl3_fat_gemm_scatter_m64', 'exl3_grouped_prefill_k4', 'exl3_fat_moe_gather', 'exl3_fat_moe_gateup', 'exl3_fat_moe_down', 'exl3_fat_moe_tile_rows_gateup', 'exl3_fat_moe_tile_rows_down', 'glm53_fast_moe_version']; missing = [s for s in syms if not hasattr(exllamav3_ext, s)]; assert not missing, ('missing symbols', missing, dir(exllamav3_ext)); assert not hasattr(exllamav3_ext, 'exl3_decode_moe_k4'), 'decode-coop symbol present but out of scope for this build'; assert exllamav3_ext.glm53_fast_moe_version() == 1, 'unexpected glm53_fast_moe_version'; print('exllamav3_ext', exllamav3_ext.__file__, 'grouped-prefill symbols=yes E3-grouped symbols=yes decode-coop=absent (by design) moe_fast=yes')"; \
     rm -rf /tmp/exllamav3 /root/.cache/pip
 
+# b12x fused-trellis MoE dependency (GLM53_EXL3_B12X_MOE=1 path in
+# overlay/exl3.py). --no-deps: every one of b12x's declared dependencies
+# (torch>=2.12, cuda-python, nvidia-cutlass-dsl==4.6.2 + its libs,
+# apache-tvm-ffi, transformers>=4.51, safetensors>=0.6, rich>=13) is
+# already present in this image at a compatible version -- verified
+# directly (nvidia-cutlass-dsl is 4.6.2 here, an exact match to b12x's
+# own pin) -- so a full dependency resolve would only risk silently
+# bumping/downgrading an already-pinned package for no reason. Version
+# pinned to 1.3.0 to match this fork's own fail-closed signature check
+# in overlay/exl3.py's build_b12x_prepared_state().
+RUN set -eux; \
+    pip install --no-deps --no-cache-dir b12x==1.3.0; \
+    python3 -c "import b12x; from b12x.moe._shared.kernels.w4a16 import prepare, kernel; assert hasattr(kernel, 'run_w4a16_moe'); assert hasattr(prepare, 'prepare_trellis256_moe_weights'); print('b12x', b12x.__file__, 'w4a16 kernel/prepare import OK')"
+
 # Keep this AFTER the CUDA compile layer so Python-only hook edits do not
 # rebuild exllamav3_ext. Exl3Config.override_quantization_method requires
 # "exl3" in ModelConfig's ordered overrides list.
@@ -671,6 +685,10 @@ COPY overlay/patch_xgrammar_termination.py /opt/glm53/patch_xgrammar_termination
 COPY tests/test_xgrammar_termination.py /opt/glm53/test_xgrammar_termination.py
 COPY overlay/patch_kpool_tail_slotmap.py /opt/glm53/patch_kpool_tail_slotmap.py
 COPY tests/test_kpool_tail_slotmap.py /opt/glm53/test_kpool_tail_slotmap.py
+COPY overlay/patch_kpool_tail_seed_stride.py /opt/glm53/patch_kpool_tail_seed_stride.py
+COPY tests/test_kpool_tail_seed_stride.py /opt/glm53/test_kpool_tail_seed_stride.py
+COPY overlay/patch_thinking_budget_guard.py /opt/glm53/patch_thinking_budget_guard.py
+COPY tests/test_thinking_budget_guard.py /opt/glm53/test_thinking_budget_guard.py
 COPY overlay/patch_spinwait.py /opt/glm53/patch_spinwait.py
 COPY tests/test_spinwait_patch.py /opt/glm53/test_spinwait_patch.py
 COPY overlay/patch_indexer_workspace.py /opt/glm53/patch_indexer_workspace.py
@@ -710,6 +728,18 @@ RUN python3 /opt/glm53/patch_scheduler_decode_floor.py
 RUN python3 /opt/glm53/patch_hybrid_prefix_hit.py
 RUN python3 /opt/glm53/patch_xgrammar_termination.py
 RUN python3 /opt/glm53/patch_kpool_tail_slotmap.py
+# Fixes a real correctness bug independently found by cbertucci33's fork
+# (commit 111425cfc, 2026-09-18): _kpool_tail_seed_kernel assumed a dense
+# 2*KPOOL*HEAD_DIM per-block stride, but this deployment pads the tail
+# cache to co-own the indexer's page size (57.75x bigger). Must run after
+# the slotmap clamp above -- both touch the same tail cache path.
+RUN python3 /opt/glm53/patch_kpool_tail_seed_stride.py
+# Model Runner V2 sampler guard fix: _requires_logits_processing never
+# checked thinking_budget_state, so a request with only thinking_token_
+# budget set (otherwise default sampling) silently skipped budget
+# enforcement. Reachable here: --reasoning-parser glm45 keeps
+# ThinkingBudgetState.enabled True.
+RUN python3 /opt/glm53/patch_thinking_budget_guard.py
 # Applied unconditionally; the injected sizing reads GLM53_INDEXER_WORKSPACE
 # at runtime and returns the stock expression unless it is "rightsize".
 RUN python3 /opt/glm53/patch_indexer_workspace.py
@@ -796,6 +826,8 @@ RUN EXL3_SELFCHECK_GPU=0 python3 /opt/glm53/test_exl3_overlay.py \
     && python3 /opt/glm53/test_hybrid_prefix_hit.py \
     && python3 /opt/glm53/test_xgrammar_termination.py \
     && python3 /opt/glm53/test_kpool_tail_slotmap.py \
+    && python3 /opt/glm53/test_kpool_tail_seed_stride.py \
+    && python3 /opt/glm53/test_thinking_budget_guard.py \
     && python3 /opt/glm53/test_spinwait_patch.py \
     && python3 /opt/glm53/test_indexer_workspace.py \
     && python3 /opt/glm53/test_ablit.py \
