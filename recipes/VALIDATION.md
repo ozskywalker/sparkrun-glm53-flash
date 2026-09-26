@@ -4019,8 +4019,19 @@ not their own benchmark script, so the number is directly comparable to this for
 
 | | Decode median | stdev | Notes |
 | --- | ---: | ---: | --- |
-| This fork's production (b12x + MTP-2) | 34.226-34.38 tok/s | 0.082-0.133 | repeated measurements this week |
-| TensorFold (`auto` policy, MTP+DFlash2) | **43.447 tok/s** | 3.752 (1 cold-start outlier; ~0.5 excluding it) | run 1 was a JIT/kernel-compile cold start (TTFT 2.66s vs ~0.22s steady-state) -- excluded from the median calc per this project's own established practice of not letting warmup runs pollute a measurement |
+| This fork's production (b12x + MTP-2) | 34.226-34.38 tok/s | 0.082-0.133 | repeated measurements this week, all warm-server raw n=20 medians |
+| TensorFold (`auto` policy, MTP+DFlash2) | **43.447 tok/s** | 3.752, raw n=20 | run 1 was a JIT/kernel-compile cold start (TTFT 2.66s vs ~0.22s steady-state), included in this median as-is |
+
+**Correction (2026-09-26, caught on advisor review before building further work on this number)**: the
+original writeup here claimed run 1 was "excluded from the median calc per this project's own established
+practice" -- that is not accurate. No prior A/B in this project has excluded a warmup run from its median;
+every historical baseline number (34.226, 32.913 MOE_FAST, 32.707 MTP-3) is a raw n=20 median measured on an
+already-warm server, with no cold-start request in the run. The 43.447 tok/s headline is unaffected -- median
+is robust to a single outlier either way -- but the reported stdev (3.752) is not apples-to-apples against
+production's 0.082-0.133, since one of the 20 TensorFold runs includes a JIT cold-start and none of the
+production runs do. **A same-methodology re-measurement (send one untimed warm-up request before the timed
+n=20, matching TensorFold's own docs' recommended practice) is needed before the spread is treated as
+comparable.** The decode-speed gain itself is not in question; the noise-level comparison was overstated.
 
 **Result: TensorFold decodes ~26-27% faster than this fork's actual current production**, on the same
 hardware, same checkpoint family, matched benchmark methodology, and an independently-verified exactness
@@ -4060,3 +4071,97 @@ a same-methodology long-context test and if TensorFold's concurrency/queueing st
 (`Vontra/GLM-5.3-Flash-MLX-4bit-MTP`, 181.7 GB/host, and the already-known DFlash2 drafter) were left in
 `/models` on both hosts after teardown (not deleted) -- ample disk headroom remains (1.1-1.6 TB free), and
 keeping them avoids a ~350 GB re-download if this is revisited.
+
+## TensorFold follow-up: long-context test finds a disqualifying prefill regression (2026-09-26)
+
+User asked to investigate TensorFold further -- more benchmarking, drafter-policy tuning, and to "seriously
+consider promoting onto this path" given the prior round's genuine +26-27% decode gain. Reused the checkpoints
+already cached from the first round (no re-download). Wrote reusable launch tooling this time
+(`recipes/scripts/tensorfold_launch.sh`, git-tracked) and a long-context probe adapted from this project's own
+`probe_longctx.py` (`recipes/probes/probe_longctx_tensorfold.py` -- TensorFold's server has no `/v1/tokenize`
+endpoint, so token counts for document sizing come from a local HF tokenizer loaded out of the already-cached
+checkpoint snapshot instead; everything else -- document generator, planted-code retrieval, TTFT/finish-reason
+checks -- is unchanged).
+
+**Correction from the prior round, made before adding new numbers on top of it**: the original writeup claimed
+a TensorFold cold-start run was excluded from its median "per this project's own established practice" -- no
+prior A/B here has done that, so the claim was wrong. The 43.447 tok/s headline is unaffected (median is
+robust to one outlier), but the reported stdev wasn't actually comparable to production's. See the correction
+inline in the section above.
+
+**Two container-config gaps found and fixed before this round's containers would even boot** (worth keeping in
+`tensorfold_launch.sh` for any future revisit, since neither was obvious from TensorFold's own docs):
+1. `pip install tensorfold` fails -- it isn't on PyPI. Correct install is
+   `pip install git+https://github.com/ashhart/TensorFold.git` (this project's first round must have done this
+   correctly but never saved a reusable script).
+2. NCCL failed to initialize the IB/RoCE fabric plugin (`Failed to initialize any NET plugin`, then
+   `wrap_ibv_reg_mr_iova2` failures once a plugin was found) until the container got `--device /dev/infiniband`
+   and `--ulimit memlock=-1:-1` -- both of which sparkrun's own Docker executor adds for every production
+   recipe (`sparkrun/orchestration/executors/docker.py`) but aren't part of TensorFold's own documented `docker
+   run` example. Without them the ranks silently fell back to a degraded transport before crashing on RDMA
+   memory registration -- this briefly looked like the known ibv_reg_mr_iova2/kernel-7.0.0-1019 regression
+   flagged (but never confirmed) in [[kernel_bump_7_0_0_1019_2026_09_17]]; it wasn't that, it was just a missing
+   container flag.
+
+**Memory ceiling is much tighter than the doc's own arithmetic suggests.** TensorFold's docs quote ~0.4 MB of
+KV cache a token past the 2,051-token dense-attention boundary; naive arithmetic against the 30.2 GB of
+headroom left after 90.8 GB of weights suggested a theoretical ~75,000-token ceiling. Booted at `--context
+32768` and measured real usage instead: **114 GB used out of 121 GB on both hosts, only ~6.9 GB free**, once
+CUDA context, activation buffers, the DFlash2 drafter and NCCL buffers are accounted for -- roughly 10 GB more
+overhead than the KV-only estimate implied. Real ceiling on this hardware is closer to **35-40K tokens**, not
+75K, and nowhere near this fleet's ~122K median prompt length. Pushing further wasn't attempted given the
+finding below made it moot.
+
+**The decisive finding: prefill throughput, not memory or drafter tuning, is what rules this out.** Ran the
+adapted long-context probe at three points, byte-identical exactness confirmed at each (drafted output equal to
+`"draft": false` output, extending the exactness guarantee past TensorFold's own toy-model-only validation):
+
+| Context | Attention path | TTFT | Prefill throughput |
+| --- | --- | ---: | ---: |
+| ~1,858 tokens | dense (their own validated zone) | 8.1s | ~230 tok/s |
+| ~29,915 tokens, run 1 (drafted) | sparse DSA (untested by them) | 153.7s | ~195 tok/s |
+| ~29,915 tokens, run 2 (`"draft":false`, same prompt) | sparse DSA | 149.2s | ~201 tok/s |
+
+Three independent measurements land in the same 195-230 tok/s band regardless of whether the attention path is
+dense or sparse, and regardless of drafting -- this rules out both "it's just the untested sparse path" and
+"it's one of their documented slow runs" (which vary 41-81% of a baseline, not a consistent ~7x). Compare
+against this fleet's real vLLM production prefill numbers at similar and larger scales
+([[sparkglm_grouped_prefill_kernel]] and `SPEED.md`'s v9-fatfork row): **~1,510-1,524 tok/s at 16.3-33.7K
+tokens, ~1,275 tok/s effective in real production traffic averaging ~101.5K tokens.** TensorFold's prefill is
+**roughly 6-8x slower than production at every comparable context length measured.**
+
+The likely reason, reading TensorFold's own "What paid" engineering notes: every optimization they list is
+scoped to the single-row decode step and small (2-8 row) speculative-decode verify windows -- nothing describes
+a batched/chunked prefill kernel. A long prompt appears to be processed through the same decode-shaped,
+per-token compute path rather than a matmul-batched prefill path, which would explain a flat ~200 tok/s
+regardless of context length or attention regime (memory-bandwidth-bound per-token cost, never getting the
+compute-bound throughput a real prefill implementation gets from batching). Not confirmed by reading their
+prefill code path directly (out of scope for this round), but consistent with every measurement taken.
+
+**Why this ends the "promote" question, and why tuning wasn't pursued further**: this fleet's traffic is
+prefill-dominated (median ~122K-token prompts; effective production prefill throughput already dwarfs decode
+throughput in real request latency). TensorFold's own decode-side drafter-policy tuning (`c3:0.35`,
+`a:0.6:0.85`, `fc5:0.3`, etc.) only touches the decode phase and cannot change a prefill-phase bottleneck --
+sweeping those policies was not pursued this round because the answer to "should we promote" doesn't depend on
+which one wins. At this fleet's real traffic shape, a request that would take vLLM production ~14s of TTFT
+(per real 2026-09 production telemetry) would take TensorFold, extrapolating linearly, on the order of **10+
+minutes of TTFT** just to reach the first token -- before the +26-27% decode gain on the reply that follows even
+starts to matter. The decode number from the first round is not in question; it simply isn't the number that
+determines this fleet's actual user-facing latency.
+
+**Concurrency, minor positive finding**: fired two concurrent short (20-line) requests against the running
+server. Both completed correctly and in overlapping wall-clock time (3.68s and 4.23s from a common start, not
+serialized to ~7.4s) -- "one request at a time" in their docs appears to describe single-instant hardware
+execution, not admission-time blocking. Not pursued further at long-context scale given the prefill finding
+above makes it moot.
+
+**Verdict: not promoted, and not worth a further tuning pass this round.** The +26-27% decode gain from the
+first round is real but answers the wrong question for this fleet's traffic shape -- prefill, not decode,
+dominates real request latency here, and TensorFold's prefill throughput is a firm 6-8x regression versus
+current production at every context length tested, confirmed dense-path and sparse-path alike, with two
+independent container-config bugs fixed and ruled out as the cause. This is a structural property of the
+engine's current implementation (decode/speculation-only optimization focus), not a tuning knob -- a
+drafter-policy sweep or higher-context memory-ceiling test would not have changed this conclusion, which is why
+neither was pursued further. Revisiting this again would need evidence that TensorFold has since shipped a
+proper batched prefill path, not just more decode-side tuning. Both checkpoints remain cached in `/models` on
+both hosts in case that day comes.
