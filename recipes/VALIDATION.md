@@ -4165,3 +4165,50 @@ drafter-policy sweep or higher-context memory-ceiling test would not have change
 neither was pursued further. Revisiting this again would need evidence that TensorFold has since shipped a
 proper batched prefill path, not just more decode-side tuning. Both checkpoints remain cached in `/models` on
 both hosts in case that day comes.
+
+## TensorFold: "can we add batched prefill ourselves?" -- tried it, real but small gain, ceiling confirmed (2026-09-26)
+
+User asked whether batched prefill could be added to TensorFold to close the gap above. Read the actual kernel
+source (not just their prose docs) before answering: `forward.py`'s docstring already describes the compute
+path as row-generic ("R consecutive tokens... up to `Buffers.rows` for prefill chunks"), and their MoE kernel
+already amortizes expert weight reads across a window's rows. `engine.py` hardcodes `prefill_rows=64` when
+constructing the engine (`GlmEngine.__init__` -> `Engine(w, ..., prefill_rows=64, ...)`), never exposed as a
+CLI flag or varied with context length. This looked like it might be a cheap, real lever rather than a from-
+scratch kernel rewrite -- worth trying rather than assuming either way.
+
+**Patched it and tested, on our own fork of the install (MIT-licensed, no upstream permission needed for local
+testing)**: added an optional 5th arg to `tensorfold_launch.sh` that sed-patches the installed package's
+`engine.py` (`prefill_rows=64,` -> `prefill_rows=${N},`) after `pip install`, before `tensorfold serve` starts.
+First attempt used `prefill_rows=512` (8x) -- **both ranks crashed the same way**: `qmm.py`'s matmul dispatcher
+buckets row counts into exactly four hardcoded tile configs, `(16, 32, 64, 128)`, and raises
+`ValueError: at most 128 rows, got 512` for anything above 128. **128 rows is a hard kernel ceiling, not a
+config choice** -- the Triton matmul kernels are only compiled/tuned for those four bucket sizes. This is
+almost certainly why the original author picked 64: it's one bucket-doubling below the actual maximum, not an
+arbitrary round number.
+
+**Retested at `prefill_rows=128`, the true maximum**: booted clean (verified the patch took via
+`docker logs | grep prefill_rows=` on both ranks), memory headroom was healthy (~6-7 GB free at `--context
+32768`, same as the unmodified baseline -- the earlier `512` attempt's memory growth was moot since it crashed
+before touching much scratch). Ran the same long-context probe as the disqualifying-finding round, twice, fresh
+seeds each time, plus confirmed exactness (codes retrieved correctly both times, matching the byte-identical
+guarantee already established):
+
+| Config | Run | Prefill throughput |
+| --- | --- | ---: |
+| `prefill_rows=64` (default, prior round) | 2 runs | 195, 201 tok/s |
+| `prefill_rows=128` (max possible) | 2 runs | 261, 272 tok/s |
+
+**Real, reproducible ~35% prefill improvement from a single hardcoded-constant change -- but it doesn't move
+the verdict.** 266 tok/s average against this fleet's real production prefill of 1,275-1,524 tok/s is still a
+**~4.8-5.7x regression** (down from ~6-8x, an improvement, but nowhere near closing the gap). The kernel
+bucketing scheme caps any further gain from this lever at exactly this ceiling -- going further would mean
+adding a new (e.g. 256 or 512-row) bucket to `qmm.py`'s `CONFIG`/`bucket()` and writing/tuning new Triton launch
+configs for it, which is genuine kernel engineering (verifying numerical exactness at a new tile size, not
+just changing a constructor argument) and a substantially bigger, riskier undertaking than what was tried here.
+
+**Verdict unchanged: not promoted.** The lever we could cheaply pull (chunk size, within the kernel's existing
+bucket ceiling) gave a real but small improvement; the lever that would actually close the gap (a genuinely
+larger batched-matmul tile) requires writing new kernels, which is out of scope for tuning this round and was
+correctly identified as such before attempting it. `tensorfold_launch.sh`'s prefill-rows patch argument is kept
+in the script (documented as experimental, ceiling noted) in case a future TensorFold release raises the
+bucket ceiling itself and this is worth re-trying with a larger value.

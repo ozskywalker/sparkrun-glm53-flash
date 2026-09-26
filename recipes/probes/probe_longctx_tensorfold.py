@@ -180,8 +180,10 @@ def main():
     decode_time = total - (first or 0)
     decode_tps = (completion_tokens - 1) / decode_time if completion_tokens and completion_tokens > 1 and decode_time > 0 else None
     prefill_tps = (prompt_tokens / first) if first and prompt_tokens else None
-    print(f"       total={total:.1f}s  ttft={first:.2f}s  prefill~{prefill_tps:.0f} tok/s  "
-          f"decode~{decode_tps:.2f} tok/s  completion_tokens={completion_tokens}", flush=True)
+    print(f"       total={total:.1f}s  ttft={first if first is None else round(first, 2)}s  "
+          f"prefill~{prefill_tps if prefill_tps is None else round(prefill_tps)} tok/s  "
+          f"decode~{decode_tps if decode_tps is None else round(decode_tps, 2)} tok/s  "
+          f"completion_tokens={completion_tokens}", flush=True)
     print(f"       answer={answer.strip()!r}", flush=True)
 
     print(f"\n{'LONG-CONTEXT CHECKS PASSED' if not FAILURES else 'FAILURES: ' + ', '.join(FAILURES)}")
