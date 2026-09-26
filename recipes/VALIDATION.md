@@ -3969,3 +3969,94 @@ clean logs both nodes, validated with a real completion request. Two
 separate incidents in one session, only one with an identified,
 already-documented cause -- the first remains genuinely unexplained
 and worth watching for recurrence.
+
+## TensorFold engine A/B: measured, real gain, not adopted this round (2026-09-26)
+
+User asked us to try [ashhart/TensorFold](https://github.com/ashhart/TensorFold), a from-scratch serving
+engine (MLX on Apple Silicon, PyTorch/Triton/CUDA on NVIDIA) with an unusual, rigorously-tested exactness
+guarantee: every drafted token is checked to be byte-identical to what one-token-at-a-time serial decoding
+would have produced (SHA-256-compared in their own test suite, and independently confirmed here -- see
+below). It ships an explicit GLM-5.3-Flash recipe for two DGX Sparks, published the same day this was
+tested (2026-09-26).
+
+**Why their own published numbers don't answer the question we actually care about**: their repo's "vs
+vLLM" comparison used vLLM serving our exact checkpoint (`Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw`) at MTP=3
+and DFlash2-at-7, through "that recipe's own launch script" -- not this fork's actual production build. Their
+measured vLLM-MTP=3 numbers (24.3-32.2 tok/s) are well below this fleet's real measured MTP-2 production
+baseline (34.226-34.38 tok/s) -- almost certainly because their baseline doesn't include the b12x
+fused-trellis MoE kernel (+8.23% decode over stock when this fork validated it, 2026-09-19) or any of this
+fork's other overlay patches. **Their "2.0-2.1x faster than vLLM" headline is a real number against their
+own baseline, but not a number that tells us anything about TensorFold vs what we actually run.** Re-measured
+head-to-head instead, against this fork's real, current production.
+
+**Setup**: `Vontra/GLM-5.3-Flash-MLX-4bit-MTP` (181.7 GB, MIT-licensed, MLX-native 4-bit affine quant in
+groups of 64, includes the MTP head) plus the same `incoai/GLM-5.3-Flash-DFlash2` drafter this fork already
+holds a research/internal-use license decision for (2026-09-24) -- both pulled to `/models` (this fleet's
+existing `HF_HUB_CACHE`, already symlinked from `~/.cache/huggingface`, confirmed zero-config-needed reuse).
+Ran inside `nvcr.io/nvidia/pytorch:26.07-py3` (their documented container), `--tp 2` across both Sparks,
+`--rank 1` (worker) started before `--rank 0` (head) per their docs, reusing this fork's own confirmed-working
+dual-rail NCCL config (`NCCL_IB_HCA=rocep1s0f0,roceP2p1s0f0`, `NCCL_SOCKET_IFNAME=enP7s7,enp1s0f0np0,enP2p1s0f0np0`
+-- the same env already running in production, see the 2026-09-25 NCCL-fabric correction above) rather than
+guessing at new values. `--no-thinking` to match this fork's own production default (TensorFold defaults
+thinking *on*, unlike this fork). Drafter policy left at `auto` (their default: races the MTP head against
+DFlash2 per request, keeps whichever commits more tokens/ms) -- deliberately not narrowed, since excluding
+DFlash2 would test a weaker TensorFold configuration than the one their own numbers used.
+
+**Both engines cannot run at once on this hardware**: one TensorFold rank alone holds 90.8 GB, and this
+fleet's nodes have 121 GB unified memory each with production already using most of it -- confirmed
+production had to be fully stopped for the test window (same constraint as every other engine-level A/B this
+project has run). Checkpoint download (~350 GB across both hosts, including the drafter) ran entirely in the
+background while production stayed up and serving; only the actual boot+benchmark+teardown needed downtime.
+
+**Exactness, independently verified, not just taken on faith**: sent the same greedy request with and without
+drafting (`"draft": false` decodes one token at a time, no speculation). Output was **byte-identical** both
+times on this fork's own real hardware and real checkpoint -- matches their own claim, confirmed independently
+rather than trusted from their docs alone.
+
+**Throughput, matched methodology**: ran this project's own `probe_throughput_ab.py` (same tool, same n=20,
+same 400-token forced completion, same temperature=0, identical to every other A/B this project has run) --
+not their own benchmark script, so the number is directly comparable to this fork's own historical baselines.
+
+| | Decode median | stdev | Notes |
+| --- | ---: | ---: | --- |
+| This fork's production (b12x + MTP-2) | 34.226-34.38 tok/s | 0.082-0.133 | repeated measurements this week |
+| TensorFold (`auto` policy, MTP+DFlash2) | **43.447 tok/s** | 3.752 (1 cold-start outlier; ~0.5 excluding it) | run 1 was a JIT/kernel-compile cold start (TTFT 2.66s vs ~0.22s steady-state) -- excluded from the median calc per this project's own established practice of not letting warmup runs pollute a measurement |
+
+**Result: TensorFold decodes ~26-27% faster than this fork's actual current production**, on the same
+hardware, same checkpoint family, matched benchmark methodology, and an independently-verified exactness
+guarantee (not the usual speculative-decoding stochastic-accept tradeoff this fork's MTP-2 and every DFlash2
+attempt so far have used). This is the first serious speed regression finding against this fork's own
+production in the DFlash2/MTP-3/MOE_FAST rejection streak -- and the first time an alternative engine has
+beaten it decisively rather than lost.
+
+**Why not adopted this round anyway** -- real, concrete gaps, not hesitation:
+1. **A different serving engine entirely, not a vLLM flag.** Every operational tool this fleet has built
+   this whole engagement -- `sparkrun`, `prelaunch_flush.sh`'s fragmentation/memory preflight, the boot-time
+   autolaunch systemd unit, the compaction flusher, the whole "stop, flush, retry" discipline -- assumes
+   vLLM's process model and log format. Adopting TensorFold means rebuilding all of that from scratch, not
+   flipping a flag.
+2. **One request at a time, documented and unmodified.** TensorFold's own docs say "Two Sparks only, one
+   request at a time." This fleet's traffic is low-concurrency but not always c=1 (prior probes have seen
+   c=2). No queuing/batching behavior to evaluate yet.
+3. **Long context is genuinely unvalidated for the real model.** TensorFold's own docs state speed past
+   2,051 tokens was measured only on a 4-layer toy model, never on the real 45-layer GLM-5.3-Flash, never on
+   two Sparks. This fleet's own median prompt length is ~122K tokens (established during the RoCE
+   investigation) -- squarely in TensorFold's own unvalidated zone. The 43.447 tok/s number is real, but it's
+   a short-prompt decode-speed number; nothing here says anything about this fleet's actual prefill-heavy
+   traffic shape.
+4. **A known GB10 slow-run pattern, undiagnosed on their end too.** Their own docs document intermittent
+   runs at 41-81% of normal speed tied to bursts of 4KB page migration, cause unknown, "not clock throttling."
+   This project has its own separate, better-understood memory-pressure/fragmentation story on this exact
+   hardware class -- worth knowing they hit a related-but-distinct phenomenon, not yet chased further here.
+5. **Maturity**: a single-author project, released the same day it was tested, no history of production use
+   to draw on for this fleet's specific failure modes (the two same-day incidents above are exactly the kind
+   of thing a newer project hasn't had time to hit and fix yet).
+
+**Verdict: a genuine, verified, meaningfully-large speed advantage -- not adopted this round given the
+engine-migration cost and unvalidated long-context path, but the first credible case in this whole engagement
+for revisiting the production engine choice itself, not just tuning vLLM further.** Worth a deliberate
+follow-up conversation (with the user, not a unilateral migration) if this magnitude of gain holds up under
+a same-methodology long-context test and if TensorFold's concurrency/queueing story matures. Both checkpoints
+(`Vontra/GLM-5.3-Flash-MLX-4bit-MTP`, 181.7 GB/host, and the already-known DFlash2 drafter) were left in
+`/models` on both hosts after teardown (not deleted) -- ample disk headroom remains (1.1-1.6 TB free), and
+keeping them avoids a ~350 GB re-download if this is revisited.
