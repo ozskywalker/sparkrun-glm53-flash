@@ -134,9 +134,30 @@ the rotation live only in memory/session context.
   OCI image (provenance-hashed) -- nothing to backport even in principle.
   Quiet since 2026-08-29. Low priority, tracked passively.
 - **gabewillen/GLM-5.3-Flash-EXL3-2x-DGX-Sparks** — added 2026-09-25 at
-  user request. Surfaced via Enntity/sparkglm's 09-22 commit, which cited
-  it as the source of some NVMe-transport code they copied. Not yet
-  triaged -- first-pass check pending.
+  user request. First-pass triage 2026-09-27: it's a **fork of MiaAI-Lab/
+  GLM-5.3-Flash-EXL3-2x-DGX-Sparks** (this project's own upstream base),
+  created 2026-09-19, 0 commits ahead / 91 behind MiaAI-Lab's current
+  `main` -- a stale snapshot with zero unique content, falling further
+  behind every round. **Dropped from active rotation** -- everything in
+  it is already covered by this project's direct MiaAI-Lab tracking above.
+- **Reederey87/glm53-flash-exl3-2x-dgx-spark** — spotted 2026-09-21, same
+  hardware/topology/checkpoint family as this fork, corroborates our own
+  arena fix and earlyoom fight. Checked ad hoc every round since; formally
+  added to this list 2026-09-27.
+- **r0b0tlab/glm53-flash-exl3-dflash2-sm121** — spotted 2026-09-21, narrower
+  scope (single GB10, TP=1, 2.25bpw, DFlash2-primary) -- structurally
+  different deployment, not directly comparable, but audited clean against
+  our own CUDA-graph capture-safety class. Checked ad hoc every round
+  since; formally added to this list 2026-09-27.
+- **ashhart/TensorFold** — added 2026-09-27 at user request ("keep an eye
+  on it"), after a three-round investigation (see "TensorFold engine A/B"
+  and its two follow-up sections above). Not a vLLM-family project --
+  a from-scratch exact-decoding serving engine (MLX+CUDA). Verdict so far:
+  genuine decode-speed advantage, but a 4.8-8x prefill regression against
+  this fleet's actual traffic shape rules it out; not promoted. Worth
+  rechecking periodically for a real batched-prefill kernel (their current
+  matmul kernel has a hard 128-row bucket ceiling) or evidence of
+  production use beyond its single author.
 
 ## Where to look for common problems
 
@@ -3755,7 +3776,17 @@ a real request (see below); everything else is desk research.
 1. **Dual-PCIe-root NCCL fabric -- already in place, correction to this
    section's own first draft.** Their `FABRIC_SUBNETS` config uses both
    ConnectX-7 PCIe roots together and measured 126K-token prefill go from
-   2,412 to 3,365 tok/s (**+39.5%**) on their 4-node setup. First pass at
+   2,412 to 3,365 tok/s (**+39.5%**) on their 4-node setup. **Correction
+   (2026-09-27): mmastrac themselves retracted this figure** two days later
+   (`6b5314b`, "Correct the both-roots prefill gain from 40% to 11%") --
+   the original 3,365 number was a partial prefix-cache hit (same-seed
+   benchmark runs shared ~30K tokens), not a clean measurement. Real
+   numbers: 2,412 (one root) vs. **2,680 (both roots), +11%**. Doesn't
+   change this section's own conclusion (we already run both roots either
+   way, so there was no action item riding on the magnitude), but the
+   +39.5% figure quoted below is stale -- keeping it struck through rather
+   than silently editing, since the reasoning that follows was written
+   against the original claim. First pass at
    this section assumed our production yaml leaves fabric selection to
    bare auto-detection and might only be using one root -- **checked the
    actual running container's env directly and that assumption was
@@ -4212,3 +4243,50 @@ larger batched-matmul tile) requires writing new kernels, which is out of scope 
 correctly identified as such before attempting it. `tensorfold_launch.sh`'s prefill-rows patch argument is kept
 in the script (documented as experimental, ceiling noted) in case a future TensorFold release raises the
 bucket ceiling itself and this is worth re-trying with a larger value.
+
+## Upstream check, 2026-09-27 (weekend delta, all 13 tracked repos + TensorFold added)
+
+Full sweep, read-only, run via 3 parallel research delegations while production stayed up and unstopped --
+no boots, no config changes. Also formally added `ashhart/TensorFold`, `Reederey87/glm53-flash-exl3-2x-dgx-
+spark` and `r0b0tlab/glm53-flash-exl3-dflash2-sm121` to the tracked-repos list above (the latter two were
+already being checked ad hoc every round since 09-21; formalizing just catches the list up to actual practice).
+
+**Two real, non-urgent leads:**
+
+1. **local-inference-lab/b12x (our production MoE kernel) -- real EXL3/GB10-relevant work accumulating
+   upstream, not yet released.** Still pinned at PyPI 1.3.0 (matches our production), but unusually active on
+   GitHub since 09-24: `#433` ("Share trellis preparation across native and EXL3 containers") directly touches
+   our quant format's checkpoint adaptation, and `#411` ("Support prepared PCIe collectives for uneven TP/DCP
+   groups") may be relevant to our TP=2 topology -- but #433's own commit message says "GPU and serving
+   qualification remain pending," so neither is safe to adopt even if we tracked `main` instead of the PyPI
+   pin. A third commit (09-24, "Absorb small-page device memory before GB10 benchmarks") independently
+   confirms GB10 small-page/fragmentation effects are real and measurable in someone else's benchmark harness
+   too -- consistent with, not new information beyond, this fork's own head-node fragmentation work. **Action:
+   none yet -- watch for an actual release past 1.3.0, then re-check #433/#411 specifically.**
+2. **Reederey87/glm53-flash-exl3-2x-dgx-spark -- a genuinely new, not-yet-ruled-out candidate.** Three commits
+   today (`#80`/`#81`/`#82`). `#80` is DFlash2/EAGLE-drafter-gated (same standing N/A reasoning as their
+   earlier patches). **`#81`/`#82` are different**: both patch vLLM's generic `block_pool.py` free-block-queue
+   eviction order (`GLM53_CACHE_TAIL_EVICT`, `GLM53_CACHE_HOT_PROTECT`) -- not gated to DFlash2 or
+   `mamba_cache_mode`, so the reasoning that closed the door on every prior Reederey87/Reederey87-adjacent APC
+   patch doesn't apply here. Their own measurement: prefix-cache hit rate 38.7% -> 98.7%, replay wall time
+   40.5s -> 1.9s on a flood-then-replay probe (two ~46K-token agents, eighteen ~31K one-shots, replay) -- a
+   generic KV-page eviction policy change any vLLM V1 deployment with `enable_prefix_caching=True` (we run
+   this) could plausibly benefit from. **Action: read the actual `#81`/`#82` diff against our own scheduler
+   config next round -- this is the one item from this sweep worth a real look, not just a watch.**
+
+**One correction to our own record** (not a new finding, a retraction of someone else's number we cited): see
+the strikethrough-and-correction inline in the 2026-09-25 upstream-check section above -- mmastrac retracted
+their dual-PCIe-root NCCL gain from +39.5% to +11% two days after we cited the original figure. Doesn't change
+our own conclusion (we already run both roots), but the number in our doc was stale.
+
+**One repo resolved and dropped**: gabewillen (see the tracked-repos list entry above) -- first full triage
+found it's a stale, zero-unique-commits fork of our own upstream, dropped from rotation.
+
+**Everything else, quiet or unchanged, no action**: MiaAI-Lab (our actual upstream base) merged ~15 PRs since
+09-25 but nothing GLM-5.3-Flash/EXL3/MTP-2-actionable beyond one detection-logic fix worth a look next round
+(PR #264, a different bug than our own already-fixed kpool stride issue -- needs a direct compare, not urgent).
+Enntity/sparkglm's `exl3` branch dormant since 09-08. mmastrac/mentat still doc-only, still N/A. tonyd2wild
+active but still NVFP4-specific, N/A. AEON-7 quiet since 09-12. cbertucci33 quiet since 09-20. Both Entrpi
+repos dormant since 09-02 (one repo's `pushed_at` ticked again with zero content, second time this pattern's
+been seen). brandonmmusic-max quiet since 08-29. r0b0tlab: one more doc-only commit, zero code changes since
+the 09-21 audit.
