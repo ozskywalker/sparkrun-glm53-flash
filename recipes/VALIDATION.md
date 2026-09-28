@@ -4290,3 +4290,114 @@ active but still NVFP4-specific, N/A. AEON-7 quiet since 09-12. cbertucci33 quie
 repos dormant since 09-02 (one repo's `pushed_at` ticked again with zero content, second time this pattern's
 been seen). brandonmmusic-max quiet since 08-29. r0b0tlab: one more doc-only commit, zero code changes since
 the 09-21 audit.
+
+## b12x #433/#411 and Reederey87 #81/#82: tried both, one dead end, one real win (2026-09-27/28)
+
+User asked to bring in and try out the two upstream leads from the 2026-09-27 sweep: b12x's #433/#411 and
+Reederey87's #81/#82.
+
+### b12x #411: confirmed inapplicable by reading the diff, not just the description
+
+The sweep flagged this as "may be relevant to our TP=2 topology" -- reading the actual PR diff settles it:
+`b12x/comm/pcie/__init__.py`'s own module docstring states "TP2-TP8 use the all-peer oneshot path;" the PR only
+extends the separate "bounded-degree islands" path (previously TP12/TP16 only) to also cover TP9/TP10/TP12/TP16.
+Our TP=2 topology stays on the all-peer oneshot path, untouched by this PR. Nothing to bring in; no code written,
+no testing needed.
+
+### b12x #433: not a validation problem, a checkpoint-format problem
+
+Read the full PR body, the new `docs/trellis-preparation.md` API contract, and `b12x/moe/checkpoints/exl3.py`'s
+actual source before attempting anything. Found something more fundamental than "the author says it's
+unqualified" (the sweep's original framing): **#433's new common API (`read_exl3_manifest`/`read_exl3_layer`/
+`trellis_from_exl3`) is a *file-based* adapter that expects a checkpoint packaged in b12x's own native
+`exl3-manifest.json` + per-layer-safetensors-with-specific-metadata-keys convention.** Checked our actual
+checkpoint directory (`Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw`) directly: it has a `MANIFEST.json`, but that's a
+generic file-integrity listing (byte counts + sha256 per file), not a b12x-schema manifest describing
+`geometry`/`layers`/`rates`/`hadamard` -- our checkpoint is an ordinary 120-shard HF safetensors checkpoint,
+parsed entirely by this fork's own `overlay/exl3.py` at load time, with no b12x-native packaging anywhere in it.
+
+This means #433's new API **cannot be pointed at our real checkpoint at all** without first re-packaging the
+whole 181.7 GB(-equivalent, this is the EXL3 4bpw checkpoint not TensorFold's MLX one) checkpoint into b12x's
+native manifest format -- a standalone conversion project, not a quick correctness check. The alternative (hand-
+constructing `TrellisSource`/`TrellisWeights` objects directly from our already-loaded in-memory tensors,
+bypassing the file-read entirely) was also assessed: the new schema's `rotations` field (shape `[num_slots,
+num_experts, 3, slot_channels]`) doesn't map 1:1 onto what our load path already computes for the OLD private API
+(`intermediate_rotations`, a different concatenation of the same underlying scale vectors) -- deriving it
+correctly would mean reverse-engineering b12x's internal math, not just renaming fields.
+
+**Verdict: not attempted further.** Given b12x's own PR text also says the alternatives to this PR "overlap and
+should not both be merged" (their own maintainers haven't settled on this as the final design) and their own CPU-
+only validation had 28 failing tests (confirmed pre-existing on the baseline too, not a regression from this PR,
+but still not a clean state), the honest assessment is: this isn't ready to chase further until b12x either ships
+a checkpoint converter or a lower-level in-memory constructor API, and even then it's a multi-day integration
+project, not a tuning pass. No code was written for this half of the ask.
+
+### Reederey87 #81/#82: ported, tested, real win from #81 alone -- #82 makes it worse
+
+Confirmed both anchors match our vendored vLLM byte-for-byte (`grep` against the running production container's
+installed `block_pool.py`/`single_type_kv_cache_manager.py`/`kv_cache_utils.py`) and confirmed no conflict with
+this fork's existing `block_pool.py`-touching patch (`patch_apc_no_store.py` touches `cache_full_blocks`/
+`cache_partial_block`, a different pair of methods than #81's `get_new_blocks`).
+
+**One real adaptation needed**: upstream's own installer scripts gate the *file edit itself* on the env var
+(skip touching `block_pool.py` entirely when the flag is unset) -- correct for their own runtime-mount
+convention, but wrong for this fork's, where every overlay patch applies unconditionally at image-build time and
+the *installed code* checks its env var at real request time (see `patch_kv_capacity_log.py` for the established
+precedent). Ported the mechanism, not upstream's gating style: `patch_cache_tail_evict.py` always patches
+`block_pool.py`, and the inserted method itself checks `GLM53_CACHE_TAIL_EVICT` on every call, falling back to
+the stock `popleft_n` pop when off (byte-identical off-behavior, just checked at a different point in the
+pipeline). `patch_cache_hot_protect.py` needed no logic change -- its flag was already runtime-checked correctly
+inside the shared `cache_tail_evict.hot_protect_enabled()`, only the outer file-edit gate was removed. Ported
+test suites too, adapted for both the logic change and a real path-resolution bug (the tests assumed the repo's
+nested `tests/`+`overlay/` sibling layout; inside the built image everything lands flat in `/opt/glm53/` -- fixed
+to detect either layout).
+
+Built as a new versioned image, `glm53-exl3-v22-cacheevict` (kept `v21-b12xmoe` completely untouched as the clean
+rollback target, this fork's own versioning discipline -- the changes were initially made in-place inside v21's
+directory by mistake and moved out before building). Hit and fixed two build-only issues along the way: a Docker
+`overlay2` "max depth exceeded" error (v21's image was already at 123 real filesystem layers; the fix was folding
+the two new patches into one existing `RUN` layer and one combined `COPY`, netting only 1 new layer instead of 7)
+and a genuine test bug of our own (an assertion that assumed the old `popleft_n` call site disappears entirely,
+which isn't true in this fork's runtime-gated design -- it's kept as the off-path fallback).
+
+**Live test**: no ready-made "eviction pressure" tool existed in either project (`bench_prefix_cache.py`, already
+in this repo, is a single cold/warm-pair test with no reason to create real block-pool competition). Wrote
+`recipes/probes/probe_cache_eviction_pressure.py`, mirroring Reederey87's own reported test shape as closely as
+their PR description allows (two ~46K-token "paused agent" conversations, eighteen ~31K-token one-shot "flood"
+requests, then replay the agents' follow-up turn) -- sized against this fleet's *actual* KV capacity read
+directly from the boot log (`GPU KV cache size: 831,629 tokens`, `usable block ids: 275`, ~3,023 tokens/block),
+not guessed. Same seed (`--seed 1001`) across all three runs for a fair, reproducible comparison. Same
+production-down discipline as every other candidate this project has tested: stop, flush, launch, confirm the
+patch's own log line fired, test, and restore to the untouched v21 image between each measurement.
+
+| Config | Replay-phase prefix-cache hit ratio | Replay TTFT (both agents) |
+| --- | ---: | ---: |
+| v22 defaults (both flags off, byte-identical to v21) | **0.0** | 38.4s / 38.1s |
+| `GLM53_CACHE_TAIL_EVICT=1` | **0.42** | 20.2s / 20.1s |
+| `GLM53_CACHE_TAIL_EVICT=1` + `GLM53_CACHE_HOT_PROTECT=1` | **0.28** | 25.1s / 25.0s |
+
+Baseline: the flood (18 x ~34K tokens) completely evicted both agents' ~50K-token prefixes -- confirmed by
+replay TTFT matching this fleet's real prefill rate (~1,324-1,330 tok/s), not a cache-hit speed. **Tail-evict
+alone recovers ~42% of that prefix on replay and roughly halves replay TTFT** -- a real, substantial, measured
+win under genuine memory pressure (which this test's flood size, calibrated against the real 275-block pool,
+actually creates). **Hot-protect layered on top makes it measurably worse, not better** (0.42 -> 0.28). This
+makes sense mechanistically: hot-protect's whole premise is protecting a prefix that a *different* request has
+already hit before its owner returns -- this test's flood is deliberately all-distinct, non-overlapping content
+(no request ever hits another request's prefix during the flood), so hot-protect has no genuine "reuse" signal to
+act on in this traffic shape, and whatever ranking noise it introduces comes at direct cost to the agents' actual
+replay hit rate. This may be a genuinely different traffic shape than this fleet's real usage (many independent
+concurrent sessions with a shared system prompt would engage hot-protect's actual intended mechanism) -- worth
+re-testing with a shared-system-prompt-style flood if hot-protect is ever revisited, but on the traffic shape
+tested here the result is unambiguous.
+
+**Caveat**: each config was measured once (not averaged over repeated trials) given the real production-down
+cost of each run (~9 min boot + ~10 min test per config, x3). The gaps (0.0 / 0.42 / 0.28) are large relative to
+what run-to-run noise would plausibly produce, but this is a single-run comparison, not a statistically averaged
+one.
+
+**Verdict: `GLM53_CACHE_TAIL_EVICT=1` is a real, positive, promotion-worthy candidate. `GLM53_CACHE_HOT_PROTECT`
+is not recommended given the measured regression on this traffic shape.** Not promoted to production this round
+-- this is a measured recommendation for the user to act on, not a unilateral production change. `v22-cacheevict`
+image remains built and available on both hosts (no rebuild needed) if the decision is made to ship it;
+`glm-5.3-flash-exl3-v22-cacheevict-vllm.yaml` is the matching recipe, identical to v21 except the image tag.
+Production was restored to the untouched `v21-b12xmoe` image after every test in this round.

@@ -1,0 +1,861 @@
+# GLM-5.3-Flash NoPE sparse MLA on SM121 (NVIDIA GB10 / DGX Spark).
+#
+# *** v20-upstreamsync amendment, 2026-09-18b (same version, local build-
+# and-validate only, opt-in and OFF by default, not benchmarked on this
+# fleet yet): one item from the 2026-09-18 upstream-recheck round against
+# MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks -- PR #217.
+#   #217 overlay/patch_exl3_decode_pipeline.py + overlay/exl3.py -- opt-in
+#        SM121 K4/N256 "thin-decode" EXL3 routed-expert kernels
+#        (GLM53_EXL3_MOE_FAST=1, default 0). Native source patch to the
+#        pinned exllamav3 build (same commit c5d9c65 upstream's patch was
+#        cut against -- no drift). Thin-only split of PR #182: the KDA FP8
+#        large-M half was excluded in full, upstream, after its own
+#        numerical study found reproducible shifts at the geometry it
+#        engaged -- none of that is in this fork. PR #217's OWN numerical
+#        study verdict is formally INCONCLUSIVE (not a pass -- the
+#        predeclared stock-vs-stock control gate itself failed, an
+#        instrument-calibration property of their study material, not
+#        evidence against the candidate; see the PR body). Descriptive
+#        serving A/B on their current-main head: +7.71% to +14.59% median
+#        decode tok/s in the range-resolved cells. This backport ports the
+#        mechanism and its fail-closed gating (wrong image, wrong device,
+#        wrong flag value all raise at load, never silently fall back) --
+#        it does NOT re-validate the numerical study against this fork's
+#        checkpoint (288 experts, TP=2) or re-run the speed A/B here.
+#        Available but off; needs this fleet's own GPU trial before
+#        anyone flips it on anywhere real.
+#
+# *** v20-upstreamsync amendment, 2026-09-18 (same version, local build-and-
+# validate only, not yet promoted): one item from the 2026-09-17 upstream-
+# check round against MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks --
+# PR #215.
+#   #215 overlay/patch_tool_choice_none.py -- honor tool_choice:"none" at
+#        decode time for the glm47 parser. Without it, a client declaring
+#        tools with tool_choice:none can get a request where the model still
+#        opens a <tool_call> block; the API layer strips it from the
+#        response but leaves no answer text, so a strict collector sees a
+#        complete tool call with nothing else and fails closed. Masks the
+#        tool-call opener via request.bad_words (same mechanism upstream's
+#        own base parsers already use for this), live for every chat
+#        request because --reasoning-parser glm45 is set. Field-validated by
+#        MiaAI-Lab on their own 2x-Spark deployment before this backport;
+#        ported close to verbatim (anchor matched byte-for-byte against this
+#        image's installed vLLM). No kill switch -- this is a correctness
+#        fix with no behavior change for any other tool_choice value, not an
+#        opt-in feature.
+#
+# *** v20-upstreamsync amendment, 2026-09-16 (same version, local build-and-
+# validate only, not yet promoted): six low-risk items queued from a
+# 2026-09-16 upstream-check round against MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-
+# DGX-Sparks -- PRs #37, #42, #81, #94, #95, #170. All six implemented:
+#   #37  overlay/patch_cache_reset.py -- opt-in /reset_prefix_cache et al.
+#        on the head API server (GLM53_EXPOSE_CACHE_RESET, default 0/off).
+#   #42  start.sh -- pipefail-safe container health checks (no more
+#        `docker inspect | grep -q` false negatives) plus a flock-based TP2
+#        lifecycle lock (start/restart/stop serialized via logs/cluster.lock).
+#   #81  start.sh -- GLM53_EXTRA_ENV diagnostic env passthrough to both
+#        ranks, opt-in, launcher-owned names rejected.
+#   #94  overlay/patch_kv_capacity_log.py -- log-only per-group KV-capacity
+#        boot-line breakdown (GLM53_KV_CAPACITY_LOG, default 1/on). Scoped
+#        down from the upstream PR to the figures directly derivable from
+#        the same config objects the stock line uses -- see the patch's own
+#        module docstring for why the upstream PR's per-spec-class dense-
+#        retention costing was not ported.
+#   #95  overlay/patch_apc_no_store.py -- per-request GPU prefix-cache
+#        no-store (SamplingParams.skip_writing_prefix_cache / vllm_xargs),
+#        ported close to verbatim (all anchors matched byte-for-byte).
+#        GLM53_APC_NO_STORE default 1 (kill switch honors the flag), but the
+#        no-store behavior itself is opt-in per request -- nothing changes
+#        unless a caller asks for it.
+#   #170 scripts/boot-shape-warmup.sh -- long-prefill ladder (3584/7168/
+#        14336/65536) so BuildPrefillChunkMetadataKernel is warm before the
+#        first long request; fixed a quadratic prompt-builder and staged
+#        large payloads via files (curl ARG_MAX).
+# See NOTES.md for the full round writeup.
+#
+# *** v20-upstreamsync amendment, 2026-09-11 (same version, added after the
+# initial promotion below): folded in MiaAI-Lab's FP8 weight-only (Marlin)
+# dense-projections path (GLM53_DENSE_FP8, ported from v16-densefp8's
+# overlay/exl3.py, originally commit eb0da1d). Re-measured against this
+# exact image rather than trusting the stale v15-combined-era A/B: decode
+# +14-17%, prefill @64K -15.6% -- the tradeoff holds, unmoved by any kernel
+# work since (E3, GB10 router-GEMM, FlashKDA, MoE-gate-dedup). Given the
+# real prefill throughput gained since v1 (~860-900 -> ~1,500-1,700+ tok/s)
+# and this fleet's ~85/15 heavy/short traffic split plus growing agentic
+# use, decided the decode win is worth the prefill give-back. Two sibling
+# recipes share this one image: glm-5.3-flash-exl3-v20-upstreamsync-vllm.yaml
+# (GLM53_DENSE_FP8=dense,kda, the default) and
+# glm-5.3-flash-exl3-v20-upstreamsync-maxprefill-vllm.yaml (unset). See
+# NOTES.md and recipes/VALIDATION.md for the full record, including the
+# coherence/accuracy check this project's own rules required before
+# shipping this on by default.
+#
+# *** v20-upstreamsync, 2026-09-11: seeded from recipes/build/glm53-exl3-
+# v19-indexercompat (current production) unchanged, PLUS four items folded
+# in from a routine upstream-check triage (MiaAI-Lab main 9c0794b..1caea9a,
+# Enntity/sparkglm exl3 branch): (1) files/chat_template.jinja -- fixed a
+# live bug where an assistant turn with content=None (tool-calls-only)
+# rendered the literal string "None" into the prompt (upstream MiaAI-Lab#156,
+# `is not none` guard only -- other hunks in that commit not ported, our
+# sort-loop structure has independently diverged); (2) start.sh's
+# count_shards() -- fixed a false-completeness bug where stale shards in an
+# old cached snapshot could satisfy the weight-present check even though the
+# *active* (refs/main) snapshot is incomplete (upstream MiaAI-Lab#153),
+# same fix applied to this fork's own separate DFlash2 shard-count call site
+# (not covered by the upstream PR, a distinct code path with the identical
+# bug); (3) LONG_PREFILL_TOKEN_THRESHOLD -- new opt-in env var plumbing
+# `--long-prefill-token-threshold`, default empty/off (upstream MiaAI-Lab#157)
+# -- left off because this fork's own patch_scheduler_decode_floor.py
+# already answers the same "long prefill freezes a warm session" problem via
+# a different mechanism, untested interaction; (4) BUILD_MIN_MEM_GIB -- a
+# build-host guard refusing `docker build` under <32 GiB MemAvailable
+# (ported from Enntity/sparkglm a8aaa229, their own original work). vLLM
+# PR #54929 (a candidate fix for the fleet's recurring #51921 shm-broadcast
+# stall) was assessed and NOT vendored -- unreviewed, has known open bugs,
+# targets a backend this fork doesn't use, contested root-cause match. See
+# NOTES.md for the full writeup of all five items (four shipped, one
+# deferred with reasons).
+#
+# --- everything below this point retains v19-indexercompat's original
+# header verbatim, since every fix it documents is unchanged in this
+# candidate ---
+#
+# *** v19-indexercompat, 2026-09-09: seeded from recipes/build/glm53-exl3-
+# v18-gb10gemm (candidate 2, PASSED, recommended for promotion) unchanged,
+# PLUS a defensive/forward-compat hardening of the ALREADY-SHIPPED
+# overlay/patch_indexer_workspace.py -- NO new overlay file, no new COPY/RUN
+# step, just changed content for the two files already copied/run below
+# (overlay/patch_indexer_workspace.py, tests/test_indexer_workspace.py).
+# Candidate 3 of 3 in the same downtime testing window as v17-nopemha
+# (candidate 1, NOT promoted -- dead code) and v18-gb10gemm (candidate 2,
+# PASSED). Makes the patch's "builder cross-check" anchor match EITHER the
+# current base's MLAAttentionSpec.compress_ratio/.storage_block_size or the
+# post-vLLM-PR-#51718 MLAAttentionSpec.tokens_per_state/.num_states form, so
+# a future rebase onto a vLLM base carrying #51718 ("[6/N][KV-Cache Layout
+# Refactor] Standardize KV cache layout", NOT present in our current base
+# image) either just works or fails with a specific message naming both
+# forms tried -- never a silent no-op, never corruption. Zero expected
+# behavior change on this build's actual base (the old anchor still matches,
+# so the patch applies byte-identically to v18-gb10gemm's). See NOTES.md,
+# overlay/patch_indexer_workspace.py's "DUAL ANCHOR" comment, and
+# recipes/VALIDATION.md for the full record.
+#
+# --- everything below this point retains v18-gb10gemm's original header
+# verbatim, since every fix it documents is unchanged in this candidate ---
+#
+# *** v18-gb10gemm, 2026-09-09: seeded from recipes/build/glm53-exl3-
+# v15-combined (current production tree) unchanged, PLUS one new overlay
+# patch: overlay/patch_gb10_router_gemm.py, a backport of vllm-project/
+# vllm#54048 ("[Bugfix][MoE] Enable cuBLAS out_dtype router GEMM on all CUDA
+# archs (fixes family-120/GB10)"). Candidate 2 of 3 in the same downtime
+# testing window as v17-nopemha (candidate 1, NOT promoted -- dead code,
+# blocked by our own already-shipped #51395 fix). See NOTES.md and
+# recipes/VALIDATION.md for the full record.
+#
+# WHAT THIS FIXES: vllm/model_executor/layers/fused_moe/router/gate_linear.py's
+# GateLinear picks a GEMM tier for the MoE router/gate computation. Tier 5
+# (the fused cuBLAS bf16xbf16->fp32 out_dtype epilogue -- one GEMM, exact
+# fp32 accumulation, no separate cast kernel) was gated on
+# allow_specialized_router_gemm, which only recognizes Hopper (SM90) or
+# is_device_capability_family(100) ("Blackwell" in the narrow SM100 sense) --
+# wrongly excluding GB10's SM121a ("family-120"), even though the cuBLAS
+# out_dtype epilogue this tier uses is a plain torch.mm kwarg with nothing
+# Hopper/SM100-specific about it. GB10 fell through to Tier 6 (plain
+# F.linear: a bf16 GEMM plus a SEPARATE bf16->fp32 cast kernel) -- an extra
+# kernel launch, and router logits that are bf16-rounded before the cast,
+# not fp32-accumulated in one epilogue. This patch decouples cuBLAS
+# eligibility into its own arch-agnostic predicate
+# (self._router_gemm_cublas_capable = is_cuda() or is_rocm(), no-bias only),
+# applied in both GateLinear.__init__ and set_out_dtype (out_dtype is
+# frequently set AFTER construction, once the expert quant method is known --
+# true for this project's exl3 path). See overlay/patch_gb10_router_gemm.py's
+# module docstring for the full trace.
+#
+# DISTINCT from this build's already-present patch_moe_gate_dedup.py
+# (vllm-project/vllm#55736 commit 3/3): that patch removes a duplicate CALL
+# to the gate module in vllm/models/glm5next/nvidia/model.py. This patch
+# controls which GEMM TIER the surviving call executes through -- a
+# completely different file, zero overlap between the two beyond both
+# touching MoE routing.
+#
+# Anchor reconciliation: NONE needed. Verified against a live container of
+# glm53-exl3-v15-combined:local before writing the patch -- the installed
+# gate_linear.py matched vllm-project/vllm#54048's own upstream "before"
+# diff context byte-for-byte at both hunks. Unlike several other backports
+# in this project's history (v10-vllmpatch, v17-nopemha), this file has NOT
+# drifted from stock upstream in this image.
+#
+# Precision/correctness angle, not primarily a throughput play: router
+# logits feed the argmax/softmax that pick routed experts for a 288-expert
+# router. Computing them via one exact fp32-accumulating GEMM instead of a
+# bf16 GEMM followed by a separate cast narrows (does not eliminate) the
+# chance of a near-tied logit pair flipping which expert wins top-k purely
+# from bf16 rounding. Applied unconditionally (this project's convention for
+# verified backports, no env-var gate), with an info_once diagnostic log
+# line that only fires when the WIDENED gate admits a device the OLD gate
+# excluded (e.g. GB10 family-120) -- never on Hopper/SM100, confirming the
+# fix actually engages on this hardware rather than silently no-op'ing.
+#
+# --- everything below this point retains v15-combined's original header
+# verbatim, since every fix it documents is unchanged in this candidate ---
+#
+# *** FORK, 2026-09-05: this tree is seeded from this project's own
+# recipes/build/../../ local checkout of MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-
+# Sparks @ c190db1 (the actual source of our production image), with
+# Enntity/sparkglm's grouped-prefill fat-expert kernel grafted in
+# (overlay/exl3_fat_gemm.cu/.cuh replaced, overlay/exl3.py taken wholesale
+# from sparkglm, overlay/patch_exl3_fat_kernel.py extended with the new
+# pybind11 bindings). Scope is deliberately grouped-prefill only
+# (EXL3_GROUPED_PREFILL_K4) -- sparkglm's separate decode-side cooperative
+# kernel (exl3_decode_moe.cu/.cuh, EXL3_DECODE_COOP_K4) is NOT included; see
+# overlay/exl3.py's own header comment and overlay/patch_exl3_fat_kernel.py
+# for the exact boundary and why leaving that code path present-but-inert is
+# safe. Everything else in this Dockerfile is unmodified from the known-
+# working upstream tree. See recipes/VALIDATION.md for the validation record.
+#
+# EXL3 weights, not NVFP4: this overlay is the MLA/KV geometry, not the GEMM.
+# Do not pass --moe-backend marlin; that flag is the NVFP4 FLASHINFER_CUTLASS
+# workaround and is the wrong backend for an EXL3 checkpoint.
+#
+# The stock image cannot serve this checkpoint on GB10. GLM-5.3-Flash is
+# NoPE MLA (qk_rope_head_dim=0, d_qk=512), and on SM12x the only sparse-MLA backend is
+# FLASHINFER_MLA_SPARSE_SM120, whose impl mandates the packed fp8_ds_mla record. Two
+# things then reject it:
+#
+#   1. concat_and_cache_mla (csrc/.../cache_kernels.cu:866) -> "pe_dim must be 64 for
+#      fp8_ds_mla", because the 656 B record is 512 NoPE + 16 B scales + 128 B RoPE.
+#   2. flashinfer/mla/_core.py:583 -> the SM120 sparse entry requires kv_lora_rank=512,
+#      qk_rope_head_dim=64 and query head dim 576.
+#
+# FlashInfer instantiates three SM120 sparse-MLA model types
+# (flashinfer/mla/_sparse_mla_sm120.py:125-170): DSV3_2 and GLM_NSA at d_qk=576 /
+# 656 B with topk in {128,512,1024,2048}, and DSV4 at d_qke=512 / 584 B (448 fp8 +
+# 64 bf16 + 8 B footer) with topk in {128,512,1024} only. GLM-5.3-Flash needs
+# d_qk=512 with index_topk=2048, which no kernel instantiates, and its uniform 512-dim
+# latent does not fit the DSv4 448/64 split.
+#
+# So run it in the GLM_NSA geometry the GLM-5.2 line already uses: zero-pad the 512-dim
+# latent to 576. A zero RoPE block adds nothing to the QK dot, softmax is unchanged, and
+# the value is taken from the 512 NoPE region (d_v=512), so the result is exact. It costs
+# 656 B/token instead of ~528 (~24% more DSA KV over 11 DSA layers) and needs no kernel
+# work. MLAAttentionSpec.real_page_size_bytes already allocates block_size * 656 for
+# fp8_ds_mla on non-deepseek_v4 models, so allocation already matches.
+#
+# The impl also inherits MLAAttentionImpl.forward_mha, which raises NotImplementedError
+# (only the SM100 sibling gets a real one via SparseMLACommonImpl). Declaring
+# supports_dense_mha_prefill=False routes prefill through the same top-k MQA kernel --
+# the same declaration rocm_aiter_mla_sparse.py:668 makes -- which is the model's own
+# sparse semantics, and it also clears the builder's prefill metadata so use_dense_mha
+# can never select the missing path.
+#
+# Third, the SM120 impl passes index_topk as both the page-table width and the top-k,
+# which this checkpoint breaks: index_kpool=4 widens the indexer's top-k buffer past
+# index_topk and rounds it up to a multiple of 128 (2048 -> 2176), so the kernel rejects
+# the table ("expects sparse block_tables shape (256, 1, 2048), got (256, 1, 2176)").
+# The SM100 sibling treats sparse_mla_top_k as page-table *capacity* and bounds each
+# query by its own valid count (flashinfer_mla_sparse.py:461-476), so ask the index
+# converter for those counts and pass the buffer width. Zero-length rows are pointed at
+# slot 0 with length 1 and their output zeroed afterwards, mirroring the same file's
+# empty-row handling.
+#
+# Capacity alone is not enough on SM120: the top-k width is a kernel template parameter,
+# not a runtime bound. sparse_mla_sm120_prefill.cu:220 rejects any GLM_NSA/DSV3_2 prefill
+# with topk != 2048, its dual-cache (two-segment) dispatcher is DSV4-only (line 406), and
+# the DSV4 dual path hardcodes a 128-wide primary. _DECODE_DSV3_2_DISPATCH likewise only
+# instantiates topk in {128,512,1024,2048}. So the candidate set has to be exactly 2048
+# wide, while this model's indexer emits up to 2051: 512 pools expanded by index_kpool=4,
+# plus an always-selected tail of up to kpool-1 tokens that have no compressed pool entry
+# yet (glm5next/nvidia/model.py:606-616, ops/kpool_compress.py:950-967).
+#
+# Fourth, the indexer's DeepGEMM paged-MQA page size. deepgemm attention.hpp:320 accepts
+# block_kv in {32,64,128} on sm_10x but only 64 on sm_120 (non-FP4 cache), while
+# vllm/utils/deep_gemm.py hardcodes PAGED_MQA_PAGE_SIZES = (32, 64) arch-blind. The kpool
+# indexer's storage block is block_size // index_kpool, and cuda.py aligns block_size to
+# index_kpool * min(PAGED_MQA_PAGE_SIZES) = 128; the hybrid KDA page constraint then
+# lands on block_size 1664, giving a 416-entry storage block. 416 is not a multiple of
+# 64, so compressed_kernel_block_size (v1/worker/utils.py:69) falls back to a 32-entry
+# page and DeepGEMM asserts. Aligning to index_kpool * 64 = 256 moves block_size to 1792,
+# whose 448-entry storage block does tile by 64.
+#
+# That raise also has to not change the MLA kernel page: select_kernel_block_size walks
+# the backend's int sizes in descending order, so [64, 256] would pick 256 for a 1792
+# manager block, and every GLM_NSA/DSV3_2 kernel is instantiated at PAGE_BLOCK_SIZE=64
+# only (_DECODE_DSV3_2_PAGE_BLOCK_SIZE, launch_prefill_sg<..., 2048, 64>). At block_size
+# 1664 that was masked -- 256 does not divide 1664 -- so pin the SM120 backend to [64].
+#
+# Drop the lowest-ranked selected pool instead of the tail: expand 511 pools (2044
+# tokens) + 3 tail = 2047 candidates in a 2048-wide buffer. That gives up 4 of 2048
+# candidate tokens (0.2%), the *last* ones in top-k rank order, and keeps the recent
+# tail, which carries the highest attention weight in a causal model and can never be
+# recovered from the pools. The alternative -- truncating the 2051-wide row to 2048 --
+# drops exactly that tail. select_k stays 512, so the indexer keeps its fused top-k fast
+# path (sparse_attn_indexer_kpool.py:810 gates on select_k in {512,1024,2048}).
+#
+# GB10 extras on top of the SM12x overlay: FlashInfer's sparse-MLA autotune and
+# fused_moe gemm1/gemm2 autotune kill rank 0 on SM121, and PDL lowering races
+# KDA state kernels here, so skip both and gate PDL to Hopper / SM10x.
+#
+# Build (context = repo root, aarch64 host):
+#   docker build -t glm53-flash-sm121:local .
+
+ARG BASE=vllm/vllm-openai:glm53-flash-arm64-cu130@sha256:905c02933be6021301db2dc284e24e3727467aa3a0f63b41d609885778a07bce
+FROM ${BASE}
+
+RUN python3 - <<'PY'
+from pathlib import Path
+
+target = Path(
+    "/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/"
+    "flashinfer_mla_sparse_sm120.py"
+)
+source = target.read_text()
+
+
+def replace_once(old: str, new: str) -> None:
+    global source
+    if source.count(old) != 1:
+        raise RuntimeError(f"expected exactly one patch target: {old!r}")
+    source = source.replace(old, new)
+
+
+replace_once(
+    '    """SM120 FlashInfer sparse-MLA implementation."""\n\n    is_sparse = True\n',
+    '    """SM120 FlashInfer sparse-MLA implementation."""\n\n'
+    "    is_sparse = True\n"
+    "    supports_dense_mha_prefill = False\n",
+)
+
+replace_once(
+    '        self.qk_rope_head_dim: int = mla_args["qk_rope_head_dim"]\n'
+    "        from vllm.config import get_current_vllm_config\n",
+    '        self.qk_rope_head_dim: int = mla_args["qk_rope_head_dim"]\n'
+    "        self.rope_pad = 0\n"
+    "        if self.qk_rope_head_dim == 0:\n"
+    "            if self.kv_lora_rank != 512:\n"
+    "                raise NotImplementedError(\n"
+    '                    "FLASHINFER_MLA_SPARSE_SM120 pads NoPE MLA into the "\n'
+    '                    "576-wide GLM_NSA geometry, which requires "\n'
+    '                    f"kv_lora_rank=512; got {self.kv_lora_rank}."\n'
+    "                )\n"
+    "            self.rope_pad = 64\n"
+    "        self.kernel_qk_rope_head_dim = self.qk_rope_head_dim + self.rope_pad\n"
+    "        from vllm.config import get_current_vllm_config\n",
+)
+
+replace_once(
+    "        if isinstance(q, tuple):\n"
+    "            q = torch.cat(q, dim=-1)\n"
+    "\n"
+    "        num_actual_toks = q.shape[0]\n",
+    "        if isinstance(q, tuple):\n"
+    "            q = torch.cat(q, dim=-1)\n"
+    "        if self.rope_pad:\n"
+    "            q = torch.nn.functional.pad(q, (0, self.rope_pad))\n"
+    "\n"
+    "        num_actual_toks = q.shape[0]\n",
+)
+
+replace_once(
+    "            qk_rope_head_dim=self.qk_rope_head_dim,\n",
+    "            qk_rope_head_dim=self.kernel_qk_rope_head_dim,\n",
+)
+
+replace_once(
+    "        topk_indices_physical = cast(\n"
+    "            torch.Tensor,\n"
+    "            triton_convert_req_index_to_global_index(\n"
+    "                attn_metadata.req_id_per_token[:num_actual_toks],\n"
+    "                attn_metadata.block_table,\n"
+    "                topk_indices,\n"
+    "                BLOCK_SIZE=attn_metadata.block_size,\n"
+    "                NUM_TOPK_TOKENS=topk_indices.shape[1],\n"
+    "            ),\n"
+    "        )\n",
+    "        topk_indices_physical, topk_lengths = cast(\n"
+    "            tuple[torch.Tensor, torch.Tensor],\n"
+    "            triton_convert_req_index_to_global_index(\n"
+    "                attn_metadata.req_id_per_token[:num_actual_toks],\n"
+    "                attn_metadata.block_table,\n"
+    "                topk_indices,\n"
+    "                BLOCK_SIZE=attn_metadata.block_size,\n"
+    "                NUM_TOPK_TOKENS=topk_indices.shape[1],\n"
+    "                return_valid_counts=True,\n"
+    "            ),\n"
+    "        )\n"
+    "        sparse_topk_capacity = topk_indices_physical.shape[1]\n"
+    "        empty_rows = topk_lengths == 0\n"
+    "        topk_indices_physical[:, 0] = topk_indices_physical[:, 0].masked_fill(\n"
+    "            empty_rows, 0\n"
+    "        )\n"
+    "        topk_lengths = topk_lengths.clamp(min=1)\n",
+)
+
+replace_once(
+    "            seq_lens=None,\n            max_seq_len=attn_metadata.topk_tokens,\n",
+    "            seq_lens=topk_lengths,\n            max_seq_len=sparse_topk_capacity,\n",
+)
+
+replace_once(
+    "            sparse_mla_top_k=attn_metadata.topk_tokens,\n",
+    "            sparse_mla_top_k=sparse_topk_capacity,\n",
+)
+
+replace_once(
+    "        return out.squeeze(1), None\n",
+    "        out = out.squeeze(1)\n"
+    "        out.masked_fill_(empty_rows.view(-1, 1, 1), 0.0)\n"
+    "        return out, None\n"
+    "\n"
+    "    def do_kv_cache_update(\n"
+    "        self,\n"
+    "        kv_c_normed: torch.Tensor,\n"
+    "        k_pe: torch.Tensor,\n"
+    "        kv_cache: torch.Tensor,\n"
+    "        slot_mapping: torch.Tensor,\n"
+    "        kv_cache_dtype: str,\n"
+    "        k_scale: torch.Tensor,\n"
+    "    ) -> None:\n"
+    "        if self.rope_pad:\n"
+    "            k_pe = k_pe.new_zeros((k_pe.shape[0], 1, self.rope_pad))\n"
+    "        super().do_kv_cache_update(\n"
+    "            kv_c_normed, k_pe, kv_cache, slot_mapping, kv_cache_dtype, k_scale\n"
+    "        )\n",
+)
+
+target.write_text(source)
+
+site = Path("/usr/local/lib/python3.12/dist-packages/vllm")
+old_width = "buffer_width = topk_tokens + (kpool - 1 if kpool > 1 else 0)"
+for rel in ("models/glm5next/nvidia/model.py", "models/glm5next/nvidia/mtp.py"):
+    path = site / rel
+    text = path.read_text()
+    if text.count(old_width) != 1:
+        raise RuntimeError(f"expected one buffer_width target in {rel}")
+    path.write_text(text.replace(old_width, "buffer_width = topk_tokens"))
+
+sparse_backend = site / "v1/attention/backends/mla/flashinfer_mla_sparse.py"
+text = sparse_backend.read_text()
+old_block_sizes = (
+    "    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:\n"
+    "        return [64, 256]\n"
+)
+if text.count(old_block_sizes) != 1:
+    raise RuntimeError("expected one SM120 kernel-block-size target")
+sparse_backend.write_text(
+    text.replace(
+        old_block_sizes,
+        "    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:\n"
+        "        return [64]\n",
+    )
+)
+
+platform = site / "platforms/cuda.py"
+text = platform.read_text()
+old_align = "        return index_kpool * min(PAGED_MQA_PAGE_SIZES)\n"
+if text.count(old_align) != 1:
+    raise RuntimeError("expected one indexer block alignment target")
+platform.write_text(
+    text.replace(
+        old_align,
+        "        page_sizes = PAGED_MQA_PAGE_SIZES\n"
+        "        capability = cls.get_device_capability()\n"
+        "        if capability is not None and capability.major == 12:\n"
+        "            page_sizes = tuple(p for p in page_sizes if p == 64)\n"
+        "        return index_kpool * min(page_sizes)\n",
+    )
+)
+
+indexer = site / "model_executor/layers/sparse_attn_indexer_kpool.py"
+text = indexer.read_text()
+for old, new in (
+    (
+        "                    expanded = expand_pools_and_append_tail(\n"
+        "                        pool_ids, q_seq, index_kpool\n"
+        "                    )\n",
+        "                    expanded = expand_pools_and_append_tail(\n"
+        "                        pool_ids[:, : select_k - 1], q_seq, index_kpool\n"
+        "                    )\n",
+    ),
+    (
+        "            out = expand_pools_and_append_tail(pool_ids, dec_seq, index_kpool)\n",
+        "            out = expand_pools_and_append_tail(\n"
+        "                pool_ids[:, : select_k - 1], dec_seq, index_kpool\n"
+        "            )\n",
+    ),
+):
+    if text.count(old) != 1:
+        raise RuntimeError(f"expected one expand-pools target: {old!r}")
+    text = text.replace(old, new)
+indexer.write_text(text)
+
+warmup = site / "model_executor/warmup/kernel_warmup.py"
+text = warmup.read_text()
+old_sparse_warmup = (
+    "    flashinfer_sparse_mla_decode_autotune_warmup(worker)\n"
+    "    deepseek_v4_sparse_mla_attention_warmup(worker)\n"
+)
+if text.count(old_sparse_warmup) != 1:
+    raise RuntimeError("expected one FlashInfer sparse-MLA warmup target")
+text = text.replace(
+    old_sparse_warmup,
+    "    # GLM53_SKIP_FI_SPARSE_WARMUP: SM120 autotune wedges rank 0 on GB10.\n"
+    "    deepseek_v4_sparse_mla_attention_warmup(worker)\n",
+)
+old_autotune = "    from flashinfer.autotuner import AutoTuner, set_autotune_process_group\n"
+if text.count(old_autotune) != 1:
+    raise RuntimeError("expected one FlashInfer autotuner import")
+text = text.replace(
+    old_autotune,
+    "    logger.info_once(\"Skipping FlashInfer autotune on SM121\")\n"
+    "    return\n"
+    "    from flashinfer.autotuner import AutoTuner, set_autotune_process_group\n",
+)
+warmup.write_text(text)
+
+platform = site / "platforms/cuda.py"
+text = platform.read_text()
+old_pdl = (
+    "            return False\n"
+    "        return major >= 9\n"
+)
+if text.count(old_pdl) != 1:
+    raise RuntimeError("expected one PDL capability gate")
+platform.write_text(
+    text.replace(
+        old_pdl,
+        "            return False\n"
+        "        # PDL lowering races KDA state kernels on SM12x (GB10).\n"
+        "        return major in (9, 10)\n",
+    )
+)
+PY
+
+RUN python3 - <<'PY'
+import inspect
+
+from vllm.v1.attention.backends.mla.flashinfer_mla_sparse_sm120 import (
+    FlashInferMLASparseSM120Impl as impl,
+)
+
+assert impl.supports_dense_mha_prefill is False
+assert "do_kv_cache_update" in impl.__dict__
+init_src = inspect.getsource(impl.__init__)
+assert "self.rope_pad = 64" in init_src
+fwd_src = inspect.getsource(impl.forward_mqa)
+assert "torch.nn.functional.pad(q, (0, self.rope_pad))" in fwd_src
+assert "qk_rope_head_dim=self.kernel_qk_rope_head_dim" in fwd_src
+assert "return_valid_counts=True" in fwd_src
+assert "sparse_mla_top_k=sparse_topk_capacity" in fwd_src
+assert "seq_lens=topk_lengths" in fwd_src
+assert "out.masked_fill_(empty_rows.view(-1, 1, 1), 0.0)" in fwd_src
+assert "attn_metadata.topk_tokens" not in fwd_src
+
+from pathlib import Path
+
+site = Path("/usr/local/lib/python3.12/dist-packages/vllm")
+for rel in ("models/glm5next/nvidia/model.py", "models/glm5next/nvidia/mtp.py"):
+    src = (site / rel).read_text()
+    compile(src, rel, "exec")
+    assert "buffer_width = topk_tokens\n" in src
+    assert "kpool - 1 if kpool > 1" not in src
+kpool_src = (site / "model_executor/layers/sparse_attn_indexer_kpool.py").read_text()
+compile(kpool_src, "sparse_attn_indexer_kpool.py", "exec")
+assert kpool_src.count("pool_ids[:, : select_k - 1]") == 2
+
+from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
+    FlashInferMLASparseSM120Backend as sm120_backend,
+)
+
+assert sm120_backend.get_supported_kernel_block_sizes() == [64]
+align_src = (site / "platforms/cuda.py").read_text()
+compile(align_src, "cuda.py", "exec")
+assert "if capability is not None and capability.major == 12:" in align_src
+assert "return index_kpool * min(page_sizes)" in align_src
+assert "return major in (9, 10)" in align_src
+warmup_src = (site / "model_executor/warmup/kernel_warmup.py").read_text()
+compile(warmup_src, "kernel_warmup.py", "exec")
+assert "flashinfer_sparse_mla_decode_autotune_warmup(worker)" not in warmup_src
+assert "Skipping FlashInfer autotune on SM121" in warmup_src
+print("glm53 NoPE sparse-MLA overlay verify OK")
+PY
+
+# EXL3/MCG trellis for routed experts (compiled for SM121, not SM120 cubins).
+# Python overlay (exl3.py) is copied AFTER the CUDA compile so edits do not
+# rebuild exllamav3_ext. The aarch64 stub patch must stay in this layer.
+COPY overlay/patch_exl3_ext_aarch64.py /opt/glm53/patch_exl3_ext_aarch64.py
+COPY overlay/patch_exl3_fat_kernel.py /opt/glm53/patch_exl3_fat_kernel.py
+COPY overlay/patch_exl3_decode_pipeline.py /opt/glm53/patch_exl3_decode_pipeline.py
+COPY overlay/exl3_fat_gemm.cu /opt/glm53/exl3-fat-kernel/exl3_fat_gemm.cu
+COPY overlay/exl3_fat_gemm.cuh /opt/glm53/exl3-fat-kernel/exl3_fat_gemm.cuh
+COPY overlay/exl3_fat_moe.cu /opt/glm53/exl3-fat-kernel/exl3_fat_moe.cu
+COPY overlay/exl3_fat_moe.cuh /opt/glm53/exl3-fat-kernel/exl3_fat_moe.cuh
+
+ARG EXLLAMAV3_COMMIT=c5d9c657966ffeeaa9353f0cc899f18629da4a13
+ENV TORCH_CUDA_ARCH_LIST=12.1a
+ENV FLASHINFER_CUDA_ARCH_LIST=12.1a
+ENV MAX_JOBS=8
+ENV CUDA_HOME=/usr/local/cuda
+ENV PATH=/usr/local/cuda/bin:${PATH}
+
+RUN python3 - <<'PY'
+from pathlib import Path
+
+init = Path("/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/quantization/__init__.py")
+text = init.read_text()
+old = 'QuantizationMethods = Literal[\n    "awq",\n'
+new = 'QuantizationMethods = Literal[\n    "exl3",\n    "awq",\n'
+if text.count(old) != 1:
+    raise RuntimeError("expected one QuantizationMethods Literal header")
+text = text.replace(old, new)
+lazy = (
+    "    # Update the `method_to_config` with customized quantization methods.\n"
+    "    method_to_config.update(_CUSTOMIZED_METHOD_TO_QUANT_CONFIG)\n"
+    "\n"
+    "    return method_to_config[quantization]\n"
+)
+lazy_new = (
+    "    from .exl3 import Exl3Config\n"
+    "    method_to_config[\"exl3\"] = Exl3Config\n"
+    "    # Update the `method_to_config` with customized quantization methods.\n"
+    "    method_to_config.update(_CUSTOMIZED_METHOD_TO_QUANT_CONFIG)\n"
+    "\n"
+    "    return method_to_config[quantization]\n"
+)
+if text.count(lazy) != 1:
+    raise RuntimeError("expected one get_quantization_config trailer")
+text = text.replace(lazy, lazy_new)
+init.write_text(text)
+print("registered exl3 in QUANTIZATION_METHODS (lazy import)")
+PY
+
+# The vLLM image keeps CUDA toolkit headers under nvidia/cu13 (cusparse.h), not
+# /usr/local/cuda/include. ExLlamaV3 also ships AVX2/AVX512 CPU targets that
+# do not compile on aarch64; stub them so the SM121 GEMM still builds.
+RUN set -eux; \
+    mkdir -p /tmp/exllamav3; \
+    curl -fsSL "https://github.com/turboderp-org/exllamav3/archive/${EXLLAMAV3_COMMIT}.tar.gz" \
+      | tar -xz -C /tmp/exllamav3 --strip-components=1; \
+    python3 -c "from pathlib import Path; assert (Path('/tmp/exllamav3')/'exllamav3/modules/quant/exl3.py').is_file()"; \
+    python3 /opt/glm53/patch_exl3_ext_aarch64.py /tmp/exllamav3/exllamav3/exllamav3_ext; \
+    python3 /opt/glm53/patch_exl3_fat_kernel.py /tmp/exllamav3/exllamav3/exllamav3_ext /opt/glm53/exl3-fat-kernel; \
+    python3 /opt/glm53/patch_exl3_decode_pipeline.py /tmp/exllamav3/exllamav3/exllamav3_ext; \
+    export CPATH="/usr/local/lib/python3.12/dist-packages/nvidia/cu13/include${CPATH:+:$CPATH}"; \
+    export CPLUS_INCLUDE_PATH="/usr/local/lib/python3.12/dist-packages/nvidia/cu13/include${CPLUS_INCLUDE_PATH:+:$CPLUS_INCLUDE_PATH}"; \
+    export C_INCLUDE_PATH="/usr/local/lib/python3.12/dist-packages/nvidia/cu13/include${C_INCLUDE_PATH:+:$C_INCLUDE_PATH}"; \
+    cd /tmp/exllamav3; \
+    TORCH_CUDA_ARCH_LIST=12.1a MAX_JOBS=8 \
+      pip install --no-deps --no-build-isolation --no-cache-dir .; \
+    python3 -c "import torch; import exllamav3_ext; syms = ['exl3_moe', 'exl3_fat_gemm', 'exl3_fat_gemm_scatter', 'exl3_fat_gemm_m64', 'exl3_fat_gemm_pair', 'exl3_fat_gemm_pair_m64', 'exl3_fat_swiglu_had', 'exl3_fat_gemm_scatter_m64', 'exl3_grouped_prefill_k4', 'exl3_fat_moe_gather', 'exl3_fat_moe_gateup', 'exl3_fat_moe_down', 'exl3_fat_moe_tile_rows_gateup', 'exl3_fat_moe_tile_rows_down', 'glm53_fast_moe_version']; missing = [s for s in syms if not hasattr(exllamav3_ext, s)]; assert not missing, ('missing symbols', missing, dir(exllamav3_ext)); assert not hasattr(exllamav3_ext, 'exl3_decode_moe_k4'), 'decode-coop symbol present but out of scope for this build'; assert exllamav3_ext.glm53_fast_moe_version() == 1, 'unexpected glm53_fast_moe_version'; print('exllamav3_ext', exllamav3_ext.__file__, 'grouped-prefill symbols=yes E3-grouped symbols=yes decode-coop=absent (by design) moe_fast=yes')"; \
+    rm -rf /tmp/exllamav3 /root/.cache/pip
+
+# b12x fused-trellis MoE dependency (GLM53_EXL3_B12X_MOE=1 path in
+# overlay/exl3.py). --no-deps: every one of b12x's declared dependencies
+# (torch>=2.12, cuda-python, nvidia-cutlass-dsl==4.6.2 + its libs,
+# apache-tvm-ffi, transformers>=4.51, safetensors>=0.6, rich>=13) is
+# already present in this image at a compatible version -- verified
+# directly (nvidia-cutlass-dsl is 4.6.2 here, an exact match to b12x's
+# own pin) -- so a full dependency resolve would only risk silently
+# bumping/downgrading an already-pinned package for no reason. Version
+# pinned to 1.3.0 to match this fork's own fail-closed signature check
+# in overlay/exl3.py's build_b12x_prepared_state().
+RUN set -eux; \
+    pip install --no-deps --no-cache-dir b12x==1.3.0; \
+    python3 -c "import b12x; from b12x.moe._shared.kernels.w4a16 import prepare, kernel; assert hasattr(kernel, 'run_w4a16_moe'); assert hasattr(prepare, 'prepare_trellis256_moe_weights'); print('b12x', b12x.__file__, 'w4a16 kernel/prepare import OK')"
+
+# Keep this AFTER the CUDA compile layer so Python-only hook edits do not
+# rebuild exllamav3_ext. Exl3Config.override_quantization_method requires
+# "exl3" in ModelConfig's ordered overrides list.
+COPY overlay/exl3.py /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/quantization/exl3.py
+COPY overlay/patch_model_overrides.py /opt/glm53/patch_model_overrides.py
+COPY overlay/qwen3_dflash2.py /opt/glm53/qwen3_dflash2.py
+COPY overlay/dflash2_speculator.py /opt/glm53/dflash2_speculator.py
+COPY overlay/patch_dflash2.py /opt/glm53/patch_dflash2.py
+COPY overlay/patch_glm_eagle3.py /opt/glm53/patch_glm_eagle3.py
+COPY overlay/patch_glm5_drafter_group.py /opt/glm53/patch_glm5_drafter_group.py
+COPY tests/test_exl3_overlay.py /opt/glm53/test_exl3_overlay.py
+COPY files/chat_template.jinja /opt/glm53/chat_template.jinja
+COPY overlay/patch_glm_video_placeholders.py /opt/glm53/patch_glm_video_placeholders.py
+COPY overlay/patch_suppress_stops_in_reasoning.py /opt/glm53/patch_suppress_stops_in_reasoning.py
+COPY tests/test_suppress_stops.py /opt/glm53/test_suppress_stops.py
+COPY overlay/patch_scheduler_decode_floor.py /opt/glm53/patch_scheduler_decode_floor.py
+COPY tests/test_scheduler_decode_floor.py /opt/glm53/test_scheduler_decode_floor.py
+COPY overlay/patch_hybrid_prefix_hit.py /opt/glm53/patch_hybrid_prefix_hit.py
+COPY tests/test_hybrid_prefix_hit.py /opt/glm53/test_hybrid_prefix_hit.py
+COPY overlay/patch_xgrammar_termination.py /opt/glm53/patch_xgrammar_termination.py
+COPY tests/test_xgrammar_termination.py /opt/glm53/test_xgrammar_termination.py
+COPY overlay/patch_kpool_tail_slotmap.py /opt/glm53/patch_kpool_tail_slotmap.py
+COPY tests/test_kpool_tail_slotmap.py /opt/glm53/test_kpool_tail_slotmap.py
+COPY overlay/patch_kpool_tail_seed_stride.py /opt/glm53/patch_kpool_tail_seed_stride.py
+COPY tests/test_kpool_tail_seed_stride.py /opt/glm53/test_kpool_tail_seed_stride.py
+COPY overlay/patch_thinking_budget_guard.py /opt/glm53/patch_thinking_budget_guard.py
+COPY tests/test_thinking_budget_guard.py /opt/glm53/test_thinking_budget_guard.py
+COPY overlay/patch_spinwait.py /opt/glm53/patch_spinwait.py
+COPY tests/test_spinwait_patch.py /opt/glm53/test_spinwait_patch.py
+COPY overlay/patch_indexer_workspace.py /opt/glm53/patch_indexer_workspace.py
+COPY tests/test_indexer_workspace.py /opt/glm53/test_indexer_workspace.py
+COPY overlay/ablit_runtime.py /opt/glm53/ablit_runtime.py
+COPY overlay/patch_ablit.py /opt/glm53/patch_ablit.py
+COPY tests/test_ablit.py /opt/glm53/test_ablit.py
+COPY ablit/LAYER_MAP.json ablit/fetch_transplant.py ablit/refusal_direction_glm53_bf_oproj.pt ablit/refusal_direction_glm53_dealign_late.pt /opt/glm53/ablit/
+# v12-combined: Track 1 vLLM-PR backport (v10) + Track 4 OOM-observer diagnostic,
+# folded onto this build's Track 2 E3 graft. See NOTES.md.
+COPY overlay/patch_nope_mqa_fix.py /opt/glm53/patch_nope_mqa_fix.py
+COPY overlay/glm53_oom_observer_runtime.py /opt/glm53/glm53_oom_observer_runtime.py
+COPY overlay/patch_oom_observer.py /opt/glm53/patch_oom_observer.py
+COPY overlay/patch_flashkda.py /opt/glm53/patch_flashkda.py
+COPY overlay/patch_moe_gate_dedup.py /opt/glm53/patch_moe_gate_dedup.py
+COPY overlay/patch_gb10_router_gemm.py /opt/glm53/patch_gb10_router_gemm.py
+COPY overlay/patch_cudagraph_align.py /opt/glm53/patch_cudagraph_align.py
+COPY tests/test_cudagraph_align.py /opt/glm53/test_cudagraph_align.py
+COPY overlay/patch_default_max_new_tokens.py /opt/glm53/patch_default_max_new_tokens.py
+COPY tests/test_default_max_new_tokens.py /opt/glm53/test_default_max_new_tokens.py
+COPY overlay/patch_dense_fp8.py /opt/glm53/patch_dense_fp8.py
+COPY overlay/patch_cache_reset.py /opt/glm53/patch_cache_reset.py
+COPY tests/test_cache_reset_endpoint.py /opt/glm53/test_cache_reset_endpoint.py
+COPY overlay/patch_kv_capacity_log.py /opt/glm53/patch_kv_capacity_log.py
+COPY tests/test_kv_capacity_log.py /opt/glm53/test_kv_capacity_log.py
+COPY overlay/patch_apc_no_store.py /opt/glm53/patch_apc_no_store.py
+COPY tests/test_apc_no_store.py /opt/glm53/test_apc_no_store.py
+COPY overlay/patch_tool_choice_none.py /opt/glm53/patch_tool_choice_none.py
+COPY tests/test_tool_choice_none.py /opt/glm53/test_tool_choice_none.py
+COPY overlay/cache_tail_evict.py overlay/patch_cache_tail_evict.py tests/test_cache_tail_evict.py overlay/patch_cache_hot_protect.py tests/test_cache_hot_protect.py /opt/glm53/
+COPY tests/test_exl3_decode_pipeline.py /opt/glm53/test_exl3_decode_pipeline.py
+RUN python3 /opt/glm53/patch_model_overrides.py
+RUN python3 /opt/glm53/patch_dflash2.py
+RUN python3 /opt/glm53/patch_glm_eagle3.py
+RUN python3 /opt/glm53/patch_glm5_drafter_group.py
+RUN python3 /opt/glm53/patch_suppress_stops_in_reasoning.py
+RUN python3 /opt/glm53/patch_scheduler_decode_floor.py
+RUN python3 /opt/glm53/patch_hybrid_prefix_hit.py
+RUN python3 /opt/glm53/patch_xgrammar_termination.py
+RUN python3 /opt/glm53/patch_kpool_tail_slotmap.py
+# Fixes a real correctness bug independently found by cbertucci33's fork
+# (commit 111425cfc, 2026-09-18): _kpool_tail_seed_kernel assumed a dense
+# 2*KPOOL*HEAD_DIM per-block stride, but this deployment pads the tail
+# cache to co-own the indexer's page size (57.75x bigger). Must run after
+# the slotmap clamp above -- both touch the same tail cache path.
+RUN python3 /opt/glm53/patch_kpool_tail_seed_stride.py
+# Model Runner V2 sampler guard fix: _requires_logits_processing never
+# checked thinking_budget_state, so a request with only thinking_token_
+# budget set (otherwise default sampling) silently skipped budget
+# enforcement. Reachable here: --reasoning-parser glm45 keeps
+# ThinkingBudgetState.enabled True.
+RUN python3 /opt/glm53/patch_thinking_budget_guard.py
+# Applied unconditionally; the injected sizing reads GLM53_INDEXER_WORKSPACE
+# at runtime and returns the stock expression unless it is "rightsize".
+RUN python3 /opt/glm53/patch_indexer_workspace.py
+RUN python3 /opt/glm53/patch_spinwait.py --preflight
+RUN python3 /opt/glm53/patch_ablit.py
+# v12-combined additions (see NOTES.md):
+# vllm-project/vllm#55736 commit 2/3 (NoPE MQA write-path fix) -- unconditional,
+# correctness-neutral perf fix, verified byte-for-byte against this image's
+# installed source.
+RUN python3 /opt/glm53/patch_nope_mqa_fix.py
+# TORCH_MEM_FRACTION / OOM-observer diagnostic -- inert unless the env var is
+# set at runtime, ported from mmastrac/glm-5.3-flash-4x-gx10 for this
+# project's unresolved "silent kill" crash investigation (Track 4).
+RUN python3 /opt/glm53/patch_oom_observer.py
+# vllm-project/vllm#55737 (FlashKDA for KDA chunked prefill) -- gated behind
+# GLM53_FLASHKDA_PREFILL (default "0", zero behavior change). PR's own real
+# benchmark numbers are GB300/SM100 only -- needs this fleet's own
+# validation before ever defaulting on. See patch_flashkda.py.
+RUN python3 /opt/glm53/patch_flashkda.py
+# v15-combined: vllm-project/vllm#55736 commit 3/3 (MoE router-GEMM dedup) --
+# unconditional, correctness-neutral perf fix. See patch_moe_gate_dedup.py.
+RUN python3 /opt/glm53/patch_moe_gate_dedup.py
+# v18-gb10gemm: vllm-project/vllm#54048 (cuBLAS out_dtype router GEMM on all
+# CUDA archs, fixes family-120/GB10) -- unconditional, correctness/precision
+# fix + one fewer kernel launch per MoE layer. Zero anchor drift from
+# upstream's own diff context. See patch_gb10_router_gemm.py and NOTES.md.
+RUN python3 /opt/glm53/patch_gb10_router_gemm.py
+# 2026-09-12: broaden spec-decode cudagraph capture-size alignment
+# (adjust_cudagraph_sizes_for_spec_decode) from decode_mode()==FULL-only to
+# any non-NONE cudagraph mode. Mined from AEON-7/vllm-ultimate-dgx-spark
+# (independent GB10 vLLM build, no EXL3/GLM overlap otherwise -- see
+# VALIDATION.md). Real, confirmed gap in this image's own vLLM
+# (config/compilation.py, verified against g487ecf187 directly) -- but NOT
+# confirmed as the cause of any specific incident on this fleet so far; a
+# no-op when decode mode already resolves to FULL (this fleet's normal
+# case), a hardening for whenever it doesn't. See patch_cudagraph_align.py
+# and NOTES.md.
+RUN python3 /opt/glm53/patch_cudagraph_align.py
+# 2026-09-15: omitted-only output-token default (decode hygiene), gated at
+# runtime behind DEFAULT_MAX_NEW_TOKENS (unset/empty = stock behavior, inert
+# by default). Backport of MiaAI-Lab PR #51 -- see patch_default_max_new_tokens.py
+# and NOTES.md. All three anchors verified byte-for-byte against this
+# image's own vLLM before being written, zero reconciliation needed.
+RUN python3 /opt/glm53/patch_default_max_new_tokens.py
+# 2026-09-11: MiaAI-Lab's FP8 weight-only (Marlin) dense-projections path
+# (originally commit eb0da1d), ported from v16-densefp8's overlay/exl3.py.
+# Gated behind GLM53_DENSE_FP8 (default "off" -- inert -- unless a recipe
+# sets it). Re-measured against this exact image (not the stale
+# v15-combined baseline v16-densefp8 was A/B'd against): decode +14-17%,
+# prefill @64K -15.6%, both consistent with the original A/B's +12%/-14.7%
+# -- confirmed the tradeoff still holds on the current kernel stack (E3,
+# GB10 router-GEMM, FlashKDA, MoE-gate-dedup all postdate the original
+# test). PROVISIONAL per upstream's own commit message ("changes target
+# numerics"); a coherence/accuracy side-by-side (not just throughput) is
+# required before shipping this on by default -- see recipes/VALIDATION.md
+# for that check. Two sibling recipes share this one image:
+# glm-5.3-flash-exl3-v20-upstreamsync-vllm.yaml (GLM53_DENSE_FP8=dense,kda,
+# the default -- this fleet's ~85/15 heavy/short traffic split and growing
+# agentic use justify trading some of the prefill headroom built up since
+# v1 for a real decode win) and
+# glm-5.3-flash-exl3-v20-upstreamsync-maxprefill-vllm.yaml (unset, for
+# workloads that want maximum prefill throughput instead).
+RUN python3 /opt/glm53/patch_dense_fp8.py
+# 2026-09-16 upstream-check round, backports of MiaAI-Lab/GLM-5.3-Flash-EXL3-
+# 2x-DGX-Sparks PRs #37, #94, #95 (see NOTES.md): opt-in cache-reset dev
+# routes (GLM53_EXPOSE_CACHE_RESET, default off), a log-only per-group
+# KV-capacity boot-line breakdown (GLM53_KV_CAPACITY_LOG, default on, scoped
+# down from the upstream PR to the directly-derivable figures -- see
+# patch_kv_capacity_log.py's module docstring), and a per-request GPU
+# prefix-cache no-store flag (GLM53_APC_NO_STORE, default on but inert
+# unless a caller actually sends skip_writing_prefix_cache). All anchors
+# verified byte-for-byte against this image's installed vLLM before being
+# written.
+RUN python3 /opt/glm53/patch_cache_reset.py
+RUN python3 /opt/glm53/patch_kv_capacity_log.py
+RUN python3 /opt/glm53/patch_apc_no_store.py
+# #215: honor tool_choice:"none" at decode time (glm47 parser) -- correctness
+# fix, no kill switch, no behavior change for any other tool_choice value.
+# Folded into one layer with the 2026-09-27 cache-eviction backports below
+# (Reederey87/glm53-flash-exl3-2x-dgx-spark PRs #81/#82: depth-first
+# prefix-cache eviction, GLM53_CACHE_TAIL_EVICT, default off; a hot-page
+# protection layer on top, GLM53_CACHE_HOT_PROTECT, default off, requires
+# tail-evict) -- overlay2 on this image is already near its lowerdir depth
+# ceiling (v21 sits at 123 real layers), so new patches get folded into an
+# existing RUN rather than adding their own. Both apply unconditionally at
+# build time and check their env var inside the installed runtime code
+# (this fork's convention, not upstream's -- see patch_cache_tail_evict.py's
+# docstring). Tail-evict must run before hot-protect (its installer asserts
+# the tail-first marker is already present).
+RUN python3 /opt/glm53/patch_tool_choice_none.py \
+    && python3 /opt/glm53/patch_cache_tail_evict.py \
+    && python3 /opt/glm53/patch_cache_hot_protect.py
+
+RUN EXL3_SELFCHECK_GPU=0 python3 /opt/glm53/test_exl3_overlay.py \
+    && python3 /opt/glm53/test_suppress_stops.py \
+    && python3 /opt/glm53/test_scheduler_decode_floor.py \
+    && python3 /opt/glm53/test_hybrid_prefix_hit.py \
+    && python3 /opt/glm53/test_xgrammar_termination.py \
+    && python3 /opt/glm53/test_kpool_tail_slotmap.py \
+    && python3 /opt/glm53/test_kpool_tail_seed_stride.py \
+    && python3 /opt/glm53/test_thinking_budget_guard.py \
+    && python3 /opt/glm53/test_spinwait_patch.py \
+    && python3 /opt/glm53/test_indexer_workspace.py \
+    && python3 /opt/glm53/test_ablit.py \
+    && python3 /opt/glm53/test_cudagraph_align.py \
+    && python3 /opt/glm53/test_default_max_new_tokens.py \
+    && python3 /opt/glm53/test_cache_reset_endpoint.py \
+    && python3 /opt/glm53/test_kv_capacity_log.py \
+    && python3 /opt/glm53/test_apc_no_store.py \
+    && python3 /opt/glm53/test_tool_choice_none.py \
+    && python3 -m pytest -q /opt/glm53/test_cache_tail_evict.py \
+    && python3 -m pytest -q /opt/glm53/test_cache_hot_protect.py \
+    && python3 /opt/glm53/test_exl3_decode_pipeline.py
+
+# Baked by start.sh --build-arg so a git pull that changes overlay/Dockerfile
+# misses this label and rebuilds once. Keep last so stamp-only rebuilds are cheap.
+ARG GLM53_RECIPE_STAMP=unknown
+LABEL glm53.recipe.stamp=${GLM53_RECIPE_STAMP}
