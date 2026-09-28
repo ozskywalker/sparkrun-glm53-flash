@@ -4401,3 +4401,24 @@ is not recommended given the measured regression on this traffic shape.** Not pr
 image remains built and available on both hosts (no rebuild needed) if the decision is made to ship it;
 `glm-5.3-flash-exl3-v22-cacheevict-vllm.yaml` is the matching recipe, identical to v21 except the image tag.
 Production was restored to the untouched `v21-b12xmoe` image after every test in this round.
+
+## v22-cacheevict PROMOTED (2026-09-28)
+
+User reviewed the measurement above and asked to promote. Baked `GLM53_CACHE_TAIL_EVICT: "1"` into
+`glm-5.3-flash-exl3-v22-cacheevict-vllm.yaml`'s `env:` block as the default (was previously only available via
+`-e` override during testing) and corrected the recipe's `description:` field, which had been copy-pasted from
+v21 and still described the b12x MoE promotion rather than this recipe's actual change. `GLM53_CACHE_HOT_PROTECT`
+left available in the image but not set -- stays off by its own default, per the measured regression above.
+
+Standard promotion discipline: `sparkrun stop` on the running v21 job, `prelaunch_flush.sh` on both hosts (clean
+on both, no fragmentation/memory preflight concerns), `sparkrun run` on the now-default-tail-evict-on v22 recipe
+(backgrounded, not `timeout`-wrapped), health-checked, validated with a real completion request. Confirmed via
+the boot log that exactly one cache-patch line fired --
+`[glm53-cache-tail-evict] deepest cached block is evicted first` -- and no hot-protect line, matching the
+intended config. Confirmed `speculative_config: {'method': 'mtp', 'num_speculative_tokens': 2}` unchanged and
+logs clean on both nodes.
+
+**Production is now `glm53-exl3-v22-cacheevict:local` with `GLM53_CACHE_TAIL_EVICT=1`.** Rollback target:
+`v21-b12xmoe` (unchanged, byte-identical to this image with the flag off, immediately available if this needs to
+be reverted). No new correctness or speed claims beyond what's already measured above -- this section exists to
+record the promotion event itself, not to re-derive the result.
