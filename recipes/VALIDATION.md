@@ -158,6 +158,14 @@ the rotation live only in memory/session context.
   rechecking periodically for a real batched-prefill kernel (their current
   matmul kernel has a hard 128-row bucket ceiling) or evidence of
   production use beyond its single author.
+- **jayleaton/glm53-tensorfold-spark** — added 2026-09-29 at user request
+  (TensorFold-specific). 57 build-time patches over TensorFold 0.3.4 for
+  this exact model on 2x Spark, serving the same TR3 4bpw EXL3 weights we
+  run. First pass 2026-09-29: their claimed prefill (~1,600 tok/s cold,
+  RigMark 8K-64K) is in our production range (~1,275-1,790), i.e. the
+  regression that sank the ashhart/TensorFold test looks largely fixed;
+  decode edge (RigMark code 68.6 tok/s) plus session/batching features
+  remain. See "jayleaton TensorFold-spark first pass" below.
 
 ## Where to look for common problems
 
@@ -4422,3 +4430,94 @@ logs clean on both nodes.
 `v21-b12xmoe` (unchanged, byte-identical to this image with the flag off, immediately available if this needs to
 be reverted). No new correctness or speed claims beyond what's already measured above -- this section exists to
 record the promotion event itself, not to re-derive the result.
+
+## Upstream delta: mmastrac/glm-5.3-flash-4x-gx10, 2026-09-28/29
+
+Repo went from a TP=4 notes repo to a full tuned serving stack in ~3 days (PR #4 merged 09-28, TP=2 support #11,
+RecoverSSM #9/#13, TP=2 memory work #15/#16; open: #20 draft-width graph sizes, #21 TP=3, #22 TP=RING4). It is a
+**different stack from ours**: NVFP4 checkpoint (dense layers FP8/NVFP4), DFlash2 drafter (CC BY-NC-ND), vLLM
+nightly ddd6fbca, mentat control plane, whole-file vLLM replacements mounted over its own image.
+
+Their TP=2 numbers (two GB10, defaults after #15/#16): prefill 32k/128k cold 2,916 / 2,830 tok/s (ours ~1,275-1,524);
+RigMark decode code/prose/structured 60.5 / 36.4 / 89.5 (RecoverSSM on); 1.1M-token KV pool (8 GiB pin,
+`max_num_batched_tokens=8192`); `max_model_len` 160k; 16 seqs; head node idles at 1.3-3.5 GiB free. **Not like-for-like
+with our benchmarks** (different checkpoint/quant, drafter, harness) -- do not quote as a delta against production.
+
+Applicability to us:
+- **N/A:** issue #7 (`glm47_failclosed` streaming tool calls) -- we run plain `glm47`. Drafter pool paging (#16) and
+  DFlash2 adaptive-k -- we run MTP-2. TP=3 / RING4 -- topology we don't have.
+- **Weak fit:** RecoverSSM (one KDA state per request instead of 1+k) -- at MTP-2 we keep 3 states not 8, so the
+  saving is much smaller; their own TP=4 gain was +1.5% at 16 streams, large only past ~50 streams.
+- **Candidates worth a look, none tried:** (1) `experimental/fixes/gb10_sparse_mla.py` (6 KB Triton sparse-MLA, claims
+  FlashInfer's runs ~10 TFLOPS on GB10 and this is 3.3x faster) -- first confirm which sparse-MLA backend our
+  prefill actually uses; (2) `arx` RDMA all-reduce for decode (13-27 us vs NCCL ~80 us; needs both ConnectX roots,
+  which we already pin) -- but it ships as custom CUDA + a 40 KB replacement `cuda_communicator.py`, so a real port;
+  (3) capping CUDA-graph capture at `max_num_seqs x (1+spec)` (#12) freed ~1-1.5 GiB/rank -- cheap, relevant to our
+  memory-pressure history.
+- **Whole-stack swap question** (their TP=2 stack vs ours on our prefill-dominated ~122K-token traffic): prefill
+  looks ~2x ours on their numbers, but 160k max len vs our 262k, tighter memory, non-commercial drafter, and we
+  measured DFlash2 -19% vs MTP-2 on our own stack. Same shape as the TensorFold verdict: needs a matched-method
+  A/B before anything is claimed. Not started.
+
+### Tried the three mmastrac/4x-gx10 candidates, 2026-09-29 (none adopted)
+
+Production was stopped for the window (single-GPU microbenchmarks + two-node NCCL probe inside the v22 image),
+then restored unchanged. Probes: `probes/gb10_sparse_mla_fp8ds.py`, `probes/bench_sparse_mla.py`,
+`probes/bench_sparse_mla_graph.py`, `probes/bench_allreduce.py`.
+
+**1. Triton sparse-MLA: rejected, slower than what we run.** Our backend is `FLASHINFER_MLA_SPARSE_SM120`
+(FlashInfer's own SM120 sparse kernel, `GLM_NSA` model type, kernel page size 64), not the FA2/SM90 path their
+kernel replaces, so "3.3x vs ~10 TFLOPS" doesn't transfer. Adapted their kernel to our packed 656-byte `fp8_ds_mla`
+layout (per-128-channel fp32 scales) and benchmarked at our per-rank shape (32 heads, 512 latent, top-k 2048):
+- Correctness: OK. Rel error vs fp32 reference 2.7e-3 (Triton) vs 3.4e-3 (FlashInfer); Triton vs FlashInfer 4.3e-3.
+- Prefill (per layer-call): T=1024 13.2 ms vs FlashInfer 6.2 ms; T=7168 90.4 ms vs 42.5 ms. Triton ~11 TFLOPS,
+  FlashInfer ~24 TFLOPS. Triton is **2.1x slower**.
+- Decode inside CUDA graphs (how decode runs): T=3 42 us vs 32 us; T=16 248 vs 157 us; T=48 649 vs 585 us.
+  FlashInfer wins at every size (eager timing showed Triton ahead at T=3, but that was Python launch overhead).
+- Probe gotcha: FlashInfer only takes its decode path when the KV page size is 64; with 3584-token pages every
+  call under 65 tokens fails, so a bench must view the cache with page size 64 to match production.
+
+**2. arx RDMA all-reduce: not ported, estimated gain ~4% decode for a large, risky port.** Measured NCCL all-reduce
+across the two nodes (bf16, hidden 4096, in a CUDA graph): 1 row 50 us, 3 rows (MTP-2 step) 52 us, 16 rows 78 us,
+48 rows 140 us; 128 rows 466 us; 7168 rows (prefill chunk) 3.07 ms. At ~90 all-reduces per forward (45 layers x 2)
+that is ~4.5 ms of a ~65 ms decode step. arx claims 13-27 us for small payloads, so ~2.5 ms/step saved, i.e. roughly
++4% decode, nothing for prefill (payload is above arx's 256 KB cutoff). Cost: custom CUDA (~46 KB) + a 40 KB
+replacement `cuda_communicator.py`, on a stack that already has the open NCCL shm-broadcast stall (vLLM #51921).
+Not worth it unless decode becomes the priority.
+
+**3. CUDA-graph capture cap: not booted, no benefit path.** Under a fixed `gpu_memory_utilization`, memory freed
+from the graph pool just becomes extra KV blocks; our KV pool is already 831K tokens against a 262K max length, and
+host-memory headroom is set by gmu, not by what the graphs use. Would only matter if gmu were lowered, which is a
+separate decision. Reasoned, not measured.
+
+Production restored on v22-cacheevict after the window.
+
+### jayleaton/glm53-tensorfold-spark first pass, 2026-09-29 (read-only review, nothing run)
+
+Added to the tracked list at user request. Single author, ~3 days old, WIP. Reviewed README/AGENTS/RESULTS/PREFILL-ANALYSIS
+and the RigMark baseline; no code executed on our hardware.
+
+**What it is:** 57 build-time patches over ashhart/TensorFold 0.3.4 (MIT), targeting GLM-5.3-Flash EXL3 TR3 4bpw on 2x
+Spark: RoCE all-gather (b12x-derived), fat-expert MoE (from Reederey87), FP8 latent KV, a shared 1M-token KV pool for 4
+requests, NVMe session tier, prompt-lookup drafting, MTP or DFlash2 (DFlash2 is CC BY-NC-ND, optional).
+
+**Why it matters for us:** the reason TensorFold was rejected (prefill 195-230 tok/s, 6-8x behind) is what this repo
+targets. Their RigMark baseline (protocol 1.1.0, unmodified suite): cold prefill 8K/32K/64K = 1,598/1,641/1,621 tok/s
+(vLLM TP2 NVFP4 in Alex Ellis's receipts: ~1,813-1,922), code decode 68.6 tok/s, prose 43.2, C1/C2/C4 aggregate
+54.3/65.5/82.2. Immediate-replay prefill (6.3K vs 11K tok/s) and C4 TTFT (1.9 s vs 0.8 s) are still behind vLLM; fixes
+are said to be in progress. RoCE all-gather A/B: +10.8% decode single stream, +4.3% at 4 streams; independently
+consistent with our own ~4% estimate for the arx all-reduce port.
+
+**Caveats before trusting the numbers:**
+- Their weights are the abliterated `brandonmusic/GLM-5.3-Flash-tr3-4bpw`, described as a byte-identical mirror of our
+  `Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw`; unverified here. Our earlier TensorFold test used the MLX 4-bit checkpoint,
+  not EXL3, so it is not a matched comparison either way.
+- FP8 latent KV diverges from bf16 KV; they report byte-identical drafted-vs-serial outputs, not equivalence to vLLM.
+- Their RigMark vs Alex's is explicitly a non-strict comparison (different weights, drafter, context, day, machines).
+- Worker-node memory is tight (TensorFold rank holds ~90 GB; cannot coexist with vLLM).
+- No production track record; the ashhart engine has no vLLM-style process/log/metrics surface, so our ops tooling
+  (Prometheus dashboard, preflight, boot autolaunch) would need re-plumbing.
+
+**Recommendation (not started):** a matched-method A/B is now justified: same EXL3 checkpoint, our real ~122K-token
+traffic shape (probe_longctx), production-down window (~2-3 h), decode + cold/warm prefill + C1/C2/C4. Promotion bar:
+prefill within ~10% of production on long context, and decode gain >= 20%.
