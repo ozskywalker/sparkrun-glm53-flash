@@ -1,0 +1,10 @@
+[Unit]
+Description=Run the GLM-5.3 kindling watchdog every minute
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=60s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

@@ -15,18 +15,30 @@ rejected it both times) — so it's now a standalone project.
 
 ## What's running right now
 
+**Since 2026-10-19: the exlr8 stack** (`recipes/exlr8/`), promoted over kindling after a matched TP=2 trial
+(VALIDATION.md, "EXLR8 ... trial"). Fallbacks: kindling NVFP4 (`recipes/kindling/kindling.sh start`) and
+v22-cacheevict (`recipes/scripts/switch_stack.sh v22`).
+
 | | |
 |---|---|
-| Model | `Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw` (EXL3 4bpw) |
-| Recipe | `recipes/glm-5.3-flash-exl3-v21-b12xmoe-vllm.yaml` |
-| Hardware | 2x DGX Spark (GB10 / SM121), TP=2 |
-| MoE kernel | b12x fused-trellis (`GLM53_EXL3_B12X_MOE=1`) |
-| Speculative decoding | MTP-2 (`{"method":"mtp","num_speculative_tokens":2}`) |
-| Context | 262,144 tokens |
-| KV cache | fp8 |
-| `gpu_memory_utilization` | 0.82 |
-| Decode throughput | ~34.2-34.4 tok/s median, single-stream |
-| TTFT | ~0.246-0.257s median |
+| Model | EXLR8 release (EXL3-trellis routed experts, k3 ~3 bpw; dense linears FP8/NVFP4), from `kindlingai/glm-5.3-flash-exlr8-gx10` @ 20b80d3 |
+| Launch | `recipes/exlr8/exlr8.sh serve` (docker compose, not sparkrun) |
+| Image | `spark-glm53:v11` + patched vLLM tree from `~/work/exlr8/tree` |
+| Speculative decoding | DFlash2 drafter, AdaptiveKScheduler |
+| Context | 262,144 tokens, `max_num_seqs` 16 |
+| KV cache | pinned 20 GiB = 3.05M tokens |
+| Hardware | 2x DGX Spark (GB10 / SM121), TP=2, single ConnectX root |
+| Controlled decode (aggregate, c1/c2/c4) | 39 / 63 / 88 tok/s (kindling 36 / 53 / 73) |
+| Controlled cold prefill | 122k: ~2,290 tok/s; 32k: 2,090-2,340 (kindling 122k: ~2,420) |
+| Free host memory under load | 12-14 GiB (kindling 0.3-1.3 GiB) |
+| Not served | multimodal images |
+
+Previous production, kindling (`recipes/kindling/`): `nvidia/GLM-5.3-Flash-NVFP4`, DFlash2 k=7, ctx 163,840,
+KV 5.6 GiB, `spark-glm53:v11`, prefill ~2,500-2,770 cold, 0.3-1.3 GiB free memory.
+
+Fallback v22-cacheevict (`recipes/glm-5.3-flash-exl3-v22-cacheevict-vllm.yaml`): EXL3 4bpw, b12x
+MoE, MTP-2, 262,144 context, fp8 KV, gmu 0.82. Everything below the Quickstart heading's
+sparkrun commands describes that path.
 
 That table goes stale the moment the config changes — `recipes/VALIDATION.md`
 is the actual source of truth, dated and append-only. If this README and
@@ -36,7 +48,14 @@ VALIDATION.md ever disagree, believe VALIDATION.md.
 
 ```
 recipes/
-  glm-5.3-flash-exl3-v21-b12xmoe-vllm.yaml   current production recipe
+  exlr8/                                     CURRENT production: exlr8.sh (serve/stop/start/restore), env files
+  kindling/                                  fallback stack: kindling.sh, up.sh, env files, watchdog, runbook
+  COMPARISON-*.md                            side-by-side reports for stack changes
+  scripts/switch_stack.sh                    kindling <-> v22 switch (refuses while requests in flight)
+  scripts/glm53_boot_launch.sh               boot launcher (GLM53_STACK=kindling|v22)
+  scripts/legacy/                            retired scripts (old TP=4 fleet watchdog)
+  glm-5.3-flash-exl3-v22-cacheevict-vllm.yaml  v22 fallback recipe (sparkrun)
+  glm-5.3-flash-exl3-v21-b12xmoe-vllm.yaml   older production recipe
   glm-5.3-flash-exl3-*.yaml                  older/experimental recipes (mostly historical)
   build/glm53-exl3-v21-b12xmoe/              production build tree: Dockerfile, vLLM overlay
                                               patches (overlay/patch_*.py), tests
@@ -59,6 +78,10 @@ recipes/
 
 ## Quickstart
 
+**Current stack (exlr8):** `recipes/exlr8/exlr8.sh serve|stop|status`. Fallback kindling: `recipes/kindling/kindling.sh start|stop|status`, see
+`recipes/kindling/README.md`. The sparkrun commands below are the v22 fallback path (or use
+`recipes/scripts/switch_stack.sh v22`).
+
 ```bash
 # Stop whatever's running (safe even if nothing is)
 sparkrun stop <job-id>            # or: sparkrun status, to find the job id
@@ -69,7 +92,7 @@ bash recipes/scripts/prelaunch_flush.sh <head-ip>,<worker-ip>
 
 # Launch. Always background it — never wrap sparkrun run in `timeout`,
 # that SIGTERMs the CLI mid-boot and kills only one rank (split-brain).
-nohup sparkrun run recipes/glm-5.3-flash-exl3-v21-b12xmoe-vllm.yaml > boot.log 2>&1 &
+nohup sparkrun run recipes/glm-5.3-flash-exl3-v22-cacheevict-vllm.yaml > boot.log 2>&1 &
 disown
 
 # Poll health separately from the launch process

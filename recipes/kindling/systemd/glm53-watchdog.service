@@ -1,0 +1,13 @@
+[Unit]
+Description=GLM-5.3 kindling watchdog (one check cycle)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=luser
+Group=luser
+ExecStart=@REPO@/recipes/kindling/kindling_watchdog.sh once
+# A restart cycle (kindling.sh start) can take ~30 min; the next timer run skips via flock.
+TimeoutStartSec=3h
+Nice=10

@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# LEGACY (moved 2026-09-30): written for the old 4-node TP=4 fleet (Reddie, tonyspark hosts,
+# vllm_glm53 container). Not used on the current 2-node cluster and not compatible with either
+# kindling or v22; kept for reference only (other docs cite its "probe /health, not /v1/models" rule).
 # fleet_watchdog.sh -- auto-recovery for the GLM-5.3 vLLM multi-node fleet.
 # Runs on Reddie (head, rank 0). Probes /health; on N consecutive failures,
 # tears down ALL containers, runs the GB10 memory ritual, relaunches

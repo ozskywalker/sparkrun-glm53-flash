@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# Boot-time production launcher for the GLM-5.3-Flash sparkrun cluster.
+# Boot-time production launcher for the GLM-5.3-Flash cluster.
+# Stack selection (default exlr8; also kindling|v22): set GLM53_STACK=v22 in the environment or
+# in /etc/glm53-boot-launch.conf (sourced if present) to boot the v22 sparkrun
+# recipe instead. Both paths are untested against a real reboot -- attend the
+# first one.
 # Runs once per boot via glm53-boot-launch.service (see that unit for the
 # systemd wiring). Waits DELAY_SECONDS before doing anything, specifically
 # so a human has a window to `systemctl stop glm53-boot-launch` and
@@ -9,7 +13,9 @@ set -euo pipefail
 
 DELAY_SECONDS="${GLM53_BOOT_LAUNCH_DELAY:-180}"
 REPO_DIR="/home/luser/spark-glm-5.3-flash-nvfp4-recipe"
-RECIPE="recipes/glm-5.3-flash-exl3-v21-b12xmoe-vllm.yaml"
+RECIPE="recipes/glm-5.3-flash-exl3-v22-cacheevict-vllm.yaml"
+[ -r /etc/glm53-boot-launch.conf ] && . /etc/glm53-boot-launch.conf
+STACK="${GLM53_STACK:-exlr8}"
 HOSTS="10.7.0.87,127.0.0.1"
 HEAD_HOST="10.7.0.87"
 SERVE_LOG="/tmp/glm53_boot_launch_serve.log"
@@ -36,6 +42,26 @@ for i in $(seq 1 60); do
 done
 
 cd "$REPO_DIR"
+
+if [ "$STACK" = exlr8 ]; then
+  # exlr8.sh serve --force: big config (KV 20 GiB, ctx 262,144), no deadman, waits for /health.
+  log "Launching production (exlr8)..."
+  exec bash recipes/exlr8/exlr8.sh serve --force
+fi
+
+if [ "$STACK" = kindling ]; then
+  # kindling.sh start --force tears down containers revived by their restart
+  # policy, drops the second-root IPv4, starts mentatd, flushes, launches
+  # worker then head, and waits for /health.
+  log "Launching production (kindling)..."
+  exec bash recipes/kindling/kindling.sh start --force
+fi
+
+[ "$STACK" = v22 ] || { log "FATAL: unknown GLM53_STACK=$STACK (exlr8|kindling|v22)"; exit 1; }
+
+# Kindling's restart-policy containers may have been revived by docker at boot.
+log "Stopping any revived kindling containers..."
+bash recipes/kindling/kindling.sh stop || true
 
 # Defensive cleanup: containers with RestartPolicy=no persist in an
 # Exited state across a reboot rather than disappearing. Clear any stale

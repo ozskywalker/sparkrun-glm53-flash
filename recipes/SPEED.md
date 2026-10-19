@@ -10,6 +10,46 @@ any row: `recipes/VALIDATION.md` (current version) or
 
 **Latest first.**
 
+## Current production: kindling main c748079, NVFP4 + DFlash2 (2026-10-09; first promoted 2026-09-30)
+
+Live numbers, Prometheus `vllm:*`, 26 h after the 2026-10-09 16:25 EDT promotion (885 requests, avg prompt 45.9K)
+against the 8 days before it on the previous build (a4671d2 + v9 + drafter 7d74cdd; 7,309 requests, avg prompt 66K):
+
+| Metric | Previous build | Current build (c748079 + v10 + bf582e4) |
+|---|---|---|
+| Live prefill, tokens per prefill-second | 1,920 | 2,048 (+7%) |
+| Decode per request, raw | 23.6 tok/s | 30.6 tok/s (traffic mix, not a speedup) |
+| Step time p50, 1 / 2 / 4+ running | 66.6 / 91.3 / 149.8 ms | 62.8 / 86.5 / 130.5 ms |
+| Implied decode per request, 1 / 2 / 4+ running | 41.8 / 30.5 / 18.6 tok/s | 41.4 / 30.1 / 19.9 tok/s |
+| Draft acceptance / tokens per step | 0.506 / 2.78 | 0.470 / 2.60 |
+| Prefix-cache hit ratio | 88.6% | 87.5% |
+| TTFT p50 / p90 | 3.29 / 7.14 s | 1.53 / 5.94 s (prompt mix differs) |
+
+Controlled A/B (2026-10-09, `probes/ab_stack.py`, same-port restore boots), current build vs previous: decode c1 41.1 vs 39.6,
+c2 aggregate 56.0 vs 52.2, c4 aggregate 73.2 vs 74.8 tok/s; prefill 32K c1 1,884 vs 2,356 (unexplained dip), c2 aggregate 2,380 vs
+2,368, c4 aggregate 2,260 vs 2,038; 122K c1 2,477 vs 2,474; warm 122K replay TTFT 1.4-2.6 s vs 3.0 s. Net: prefill +7% and shorter
+steps at 4+ running, decode per request level, acceptance lower. MemAvailable is clamped to 0 on both nodes for hours (no kills).
+Details: `COMPARISON-...-2026-09-30.md` section 5 and `VALIDATION.md`.
+
+### First kindling promotion numbers (2026-09-30, build a4671d2)
+
+Promoted over v22-cacheevict. Full tables: `COMPARISON-v22-exl3-mtp2-vs-kindling-nvfp4-dflash2-2026-09-30.md`;
+record: `VALIDATION.md`. Numbers from `probes/ab_stack.py` (controlled) and Prometheus `vllm:*` (live).
+
+| Metric | v22-cacheevict | kindling |
+|---|---|---|
+| Cold prefill 16K-122K (controlled) | 1,275-1,791 tok/s | 2,500-2,770 tok/s |
+| Live prefill, tokens per prefill-second | 1,462 | 2,127 (+45%) |
+| Live decode per request | 34.9 tok/s | 32.0 tok/s (-8%) |
+| Decode, 1 request (controlled) | 26-33 tok/s | 42-44 tok/s |
+| Decode, 4 concurrent aggregate | n/a | 68.6-72.4 tok/s |
+| Live prefix-cache hit ratio | 92.8% | 83.1% |
+
+Live comparison windows differ in traffic mix (avg prompt 117K vs 56K tokens). The live decode gap
+(-8%) is concurrency, not decoder speed: p50 step time at c=1 is 67 ms (kindling) vs 63 ms (v22), but
+v22 live traffic never exceeded c=1 while kindling runs c=2-6 (see VALIDATION.md).
+
+
 ## Current production: v20-upstreamsync, two recipes sharing one image (2026-09-11)
 
 Same `glm53-exl3-v20-upstreamsync:local` image, toggled by one env var
