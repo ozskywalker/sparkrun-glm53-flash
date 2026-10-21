@@ -34,7 +34,7 @@ Checked periodically ("routine upstream check") for anything applicable to
 this fork. Add new repos here when the user names one, rather than letting
 the rotation live only in memory/session context.
 
-**Last full sweep: 2026-10-09** (all repos below checked to their `HEAD` of that date; see "Upstream sweep, 2026-10-09"). `brandonmmusic-max/glm-5.3-flash-exl3-4bpw` now 404s: drop it.
+**Last full sweep: 2026-10-21** (all repos below checked to their `HEAD` of that date; see "Upstream sweep, 2026-10-21"). `brandonmmusic-max/glm-5.3-flash-exl3-4bpw` still 404s: stays dropped.
 
 - **MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks** — the actual upstream this
   fork is built from (pinned, currently `c190db1`-lineage, drifted since).
@@ -107,7 +107,13 @@ the rotation live only in memory/session context.
   (build the fused layout incrementally as shards stream in, never
   materializing the full standard-layout state first) avoids it entirely.
   Revisit only if this fork is ever willing to take on load-time-loader
-  surgery, not a thin adapter.
+  surgery, not a thin adapter. **Archived 2026-10-06, confirmed 2026-10-21:**
+  development moved into `flashinfer-ai/flashinfer` (merged
+  `flashinfer/experimental/b12x`, PR #5767, commit `fc8fdc17f70`); the
+  `b12x` Python import path is preserved as a compatibility shim but there
+  will be no more standalone b12x releases. **Track `flashinfer-ai/flashinfer`
+  (the `b12x` subtree) going forward, not this repo** -- drop the "wait for a
+  release past 1.3.0" framing, it no longer applies.
 - **Entrpi/glm-5.3-flash-exl3-2x-spark** — added 2026-09-18 at user
   request. Same target model/checkpoint/hardware as this fork
   (brandonmusic's EXL3 4bpw quant, incoai DFlash2 k=7 drafter, 2x DGX
@@ -169,7 +175,22 @@ the rotation live only in memory/session context.
   RigMark 8K-64K) is in our production range (~1,275-1,790), i.e. the
   regression that sank the ashhart/TensorFold test looks largely fixed;
   decode edge (RigMark code 68.6 tok/s) plus session/batching features
-  remain. See "jayleaton TensorFold-spark first pass" below.
+  remain. See "jayleaton TensorFold-spark first pass" below. Growing fast as
+  of 2026-10-21: external contributors beyond the single author now, 6 PRs
+  merged in the two days before this sweep. Our 2026-09-29 recommendation
+  (a matched-method A/B against real traffic) was never run.
+- **kindlingai/glm-5.3-flash-exlr8-gx10** — added 2026-10-21; this is the
+  actual upstream source for our current production stack (EXLR8 TP=2,
+  promoted 2026-10-19 at `20b80d3`). Should have been added to this list at
+  promotion time rather than only described inline in the EXLR8 section
+  below. The companion patched-vLLM-tree repo cited at promotion time,
+  `kindlingai/vllm-exlr8`, no longer resolves via the GitHub API or search
+  as of this sweep -- likely folded into this repo's own `BASE` re-pin
+  commits (e.g. "Re-pin BASE to the preserved mmastrac/vllm-openai copy")
+  rather than renamed; unconfirmed, re-check if it matters later. Moving
+  fast: 16 commits since our pin, including one that fixes our own
+  documented "no multimodal" limitation -- see "Upstream sweep, 2026-10-21"
+  below.
 
 ## Where to look for common problems
 
@@ -711,3 +732,89 @@ is the fallback; v22 remains the second fallback.
 - To roll back to kindling: `recipes/exlr8/exlr8.sh restore` (disarms, stops exlr8, starts kindling), then remove `START_CMD`
   from the watchdog conf and set `GLM53_STACK=kindling`.
 - Known losses vs kindling: no multimodal (images disabled), custom weight format and kernel with one upstream.
+
+## Upstream sweep, 2026-10-21 (exlr8 TP=2 is the live stack; read-only, nothing restarted)
+
+Delta since the last full sweep (2026-10-09) plus the exlr8 promotion (2026-10-19). Checked via `gh api`
+(pushed_at, releases, commits, PR bodies) against each repo's last-known commit/date in this file.
+
+**Finding 1 (actionable, resolves a known limitation): exlr8-gx10 upstream now serves images.** Our EXLR8
+PROMOTED section above lists "no multimodal (images disabled)" as a known loss vs kindling. Upstream PR #11
+(`kindlingai/glm-5.3-flash-exlr8-gx10`, merged 2026-10-19, two commits after our `20b80d3` pin) adds a
+`dense/vision-bf16.safetensors` file to the HF checkpoint (`kindlingai/glm-5.3-flash-exlr8-k2-k3-k4` commit
+`6425b75`, the 347 `model.visual.*` tensors byte-identical to the NVFP4 checkpoint's tower) plus loader/snapshot
+changes (`exlr8_loader.py`, `weight_snapshot.py`) and drops the forced `LIMIT_MM=0` in `exlr8.yaml`. Same PR also
+fixes a real problem the old flat 38 GiB KV pin had at TP=3 (left the head 0.5 GiB free, 4 GiB into swap before
+any load): the entrypoint now sizes the pin per TP, with separate DGX-OS/spark-os tables. Smoke test (image
+question) passes at TP=1-4; TP=4 gates on v28 (vision on, 40 GiB pin) show NLL +0.0000, GSM8K 98.0%, HumanEval
+157/164, decode 124.5/72.1 tok/s, prefill 4,408/4,437 tok/s (close to their README's 128.0/72.5 and 4,393/4,190).
+Default image moved to v28. **We are mid-download of the exlr8 checkpoint right now (started 2026-10-21 08:32,
+`kindlingai/glm-5.3-flash-exlr8-k2-k3-k4`) -- the current `main` revision should already include the vision
+tower file, no separate checkpoint pull needed.** Pulling this upstream delta into `~/work/exlr8` and rebuilding
+would both restore multimodal and fix the TP=3 KV-pin-at-load-time margin; not done, worth a real trial given it
+directly answers our own documented gap. The repo moved 16 commits past our pin in 2 days (PR #12 ring/cable-order
+fix, #13/#104 fabric-test fix, #1/#100 arx two-shot kernel up to 16 MB -- same optimization landing in kindling's
+own repo in parallel, see Finding 2) -- treat the whole range as one rebuild, not just PR #11.
+
+**Finding 2: kindling (our fallback stack) also moved fast, including a direct fix to a trap we hit and
+documented ourselves.** `kindlingai/glm-5.3-flash-gx10` main went `4d93ef7..f14b1fe` (our v11 pin is `4d93ef7`,
+2026-10-13). The headline item is PR #62/#73, "check weight snapshots against sampled tensor bytes, so a
+same-shape checkpoint update loads fresh" -- this is exactly the trap our 2026-10-09 sweep's Finding 1 above
+describes (kindling issue #62: safetensors-header-keyed snapshots silently served the stale `7d74cdd` drafter
+instead of `bf582e4` unless the snapshot dir was moved aside by hand). Upstream has now fixed the root cause;
+we worked around it manually. Also landed: the same arx two-shot kernel as exlr8 (#92/#93/#94/#100), the same
+ring/fabric fixes (#103/#104), a new `gate/longreply.py` diagnostic ("flags decode drifting from prefill as a
+long reply grows," #74/#96), and a `torch-profiler` compose overlay. Default image moved to v28 here too. Not
+urgent to pull (we're on exlr8, not kindling, in production) but relevant if we ever roll back, and the snapshot
+fix is a general correctness improvement worth carrying into any future kindling rebuild.
+
+**Finding 3: local-inference-lab/b12x archived -- the "wait for a release past 1.3.0" question is now moot.**
+Confirmed archived 2026-10-06. Development folded into `flashinfer-ai/flashinfer` (PR #5767, merged commit
+`fc8fdc17f70`, lives at `flashinfer/experimental/b12x`); the `b12x` Python import path is kept as a compatibility
+shim (`pip install 'flashinfer-python[b12x]'`, `import b12x` unchanged) but there will be no more standalone
+`local-inference-lab/b12x` releases, tags, or issues. VALIDATION.md's tracked-repo entry updated above to point
+future checks at FlashInfer's own release cadence instead.
+
+**Finding 4: Enntity/sparkglm shipped a major unification release same-day as this sweep** (`unified-20261021`,
+published 2026-10-21 08:14 UTC). One image now serves 2 or 4 DGX Sparks with "Strict" (preserves checkpoint
+weight formats, FP8 KV, no cross-engine bitwise promise) and "Spark" (measured corrected-rounding FP4 + DFlash2)
+modes, prefix caching, optional native MTP in Strict, and TP4 chain/ring. Published Spark-mode TP2 decode: prose
+37.5, code 67.2, structured 89.8 tok/s (two-run medians, uncapped clocks, low reasoning effort, <4,096 output
+tokens -- not our methodology, not directly comparable to exlr8's 39.2/62.5/88.4 c1 numbers above). The 3,008
+tok/s cold-64K-prefill figure is explicitly re-used from an earlier qualification run, not new. Still a different
+engine (Atlas, not vLLM) with its own release/support surface and "two-run medians... do not establish
+statistical significance" caveat stated in their own notes. Verdict: interesting if the prefix-cache or TP4 story
+ever becomes relevant, but no matched-method comparison exists -- same bar as every other engine-swap candidate
+in this file (TensorFold, kindling's own three-way A/B). Not actionable without a real A/B.
+
+**Finding 5: ashhart/TensorFold v1.1.1 (2026-10-19) touches GLM-specific prefill batching directly.** "GLM CUDA
+stepped serving interleaves fresh prompt chunks with running decode... batch eligible fresh text prompts across
+ranks... at most 16 prompts and 2,048 rows per pass" -- this is in the area of the 128-row bucket ceiling that
+sank our own TensorFold A/B (see "TensorFold: 3 rounds" history). Also: GB10 efficiency-core pinning now
+documented in their runbook (#1033, our hardware specifically), and a known-issues note that someone got the
+ModelOpt NVFP4 checkpoint loading and serving on two GB10s at TP=2 on 1.1.0 (#1040, community-reported, "scored
+prompts and more than two ranks are untested"). Needs a closer look at whether the stepped-serving change
+actually lifts the 128-row ceiling before concluding anything -- flagging, not re-testing this round.
+
+**Finding 6: jayleaton/glm53-tensorfold-spark growing past single-author.** 6 PRs merged 2026-10-18 to 2026-10-20
+from 4 distinct external contributors (ryanmitchellneely, sayyidfareed, kuhlsnu, plus jayleaton's own), including
+a tool-call-closing fix, an NVMe session-tier index-memory fix, and "ops/prod-hardening." Our 2026-09-29
+recommendation for a matched-method A/B (same EXL3 checkpoint, our real ~122K traffic shape) was never run and
+is now slightly stale as the patch set has moved; re-baseline before running it rather than using the 2026-09-29
+read.
+
+**Quiet / no actionable change:** `MiaAI-Lab` -- docs/credit commits only since 2026-10-09. `mmastrac/mentat`,
+`tonyd2wild/...NVFP4-DFlash2`, `Entrpi/glm-5.3-flash-exl3-2x-spark` (quiet since 09-02), `r0b0tlab`, `AEON-7` --
+no push since before the last sweep or docs-only. `Entrpi/vllm-glm-5.3-flash-spark` pushed 2026-10-17 per repo
+metadata but its commit history is unchanged since 2026-09-02 -- the push likely touched a non-default ref; not
+chased further this round. `cbertucci33` release-9 (2026-10-11) is loading/cleanup hardening (streamed DFlash
+checkpoint tensors, iterator-close-on-error, InstantTensor cleanup-on-failure) plus a same-deployment regression
+table (65,580-token warm-cache request: cold 41.35 s, warm 3.43 s) -- EXL3-lineage, relevant only if we return to
+v22, nothing new architecturally. `Reederey87` no new tag past `v1.6.0` (already noted 2026-10-09), minor commits
+since. `brandonmmusic-max/glm-5.3-flash-exl3-4bpw` still 404s, stays dropped. No new repos found worth adding
+this round (general GitHub search for GLM-5.3-Flash/EXL3/DGX-Spark/GB10 turned up only forks/mirrors of repos
+already tracked here).
+
+**Net for us:** Finding 1 (exlr8 multimodal + per-TP KV pin fix) is the one item worth a real trial -- it
+directly reverses a known production limitation and we're already downloading the checkpoint revision it needs.
+Everything else is tracking-only this round.
