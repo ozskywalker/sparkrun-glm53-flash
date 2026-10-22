@@ -733,6 +733,45 @@ is the fallback; v22 remains the second fallback.
   from the watchdog conf and set `GLM53_STACK=kindling`.
 - Known losses vs kindling: no multimodal (images disabled), custom weight format and kernel with one upstream.
 
+#### Re-pinned to upstream `6f5ede7`: multimodal restored (2026-10-22)
+
+Operator decision after the PR#11 trial above ("exlr8-gx10 PR#11 trial, attempt 3: real data") -- promote.
+Production's pin moved `20b80d3` -> `6f5ede7` (16 commits, same range the 2026-10-21 sweep's Finding 1 flagged),
+image `spark-glm53:v11` -> `v12` (the already-built, already-tested image retagged, not rebuilt), weight-snapshot
+tag `k3-tp2` -> `k3-tp2-v2` (bumped deliberately to force a fresh snapshot rather than risk loading a stale one
+under new checkpoint bytes -- see kindling's own snapshot-staleness trap in Finding 2 below). KV/ctx unchanged
+(20 GiB pinned, 262,144 ctx, gmu 0.86) -- same arm B config as the original promotion, just on the new tree.
+
+- **Multimodal now works**, reversing the "no multimodal" loss listed just above: full `smoketest/run.sh` 8/8
+  on production post-promotion, including `image_question` (correctly reads "1450" from the test table image).
+  This closes the main gap this re-pin existed to fix.
+- **Prefill +6.0/+13.4/+4.7%** at c1/c2/c4 (32k, cold, matched methodology) vs the 2026-10-19 baseline
+  (2,243/2,089/2,338 -> 2,378/2,369/2,447). A real, measured gain, not noise (repeated on rerun during the trial).
+- **KV pool at TP=2 unchanged**: `3,050,402` tokens, identical to before. The upstream per-TP KV pin fix changes
+  the *default* for exlr8 at TP=2 (8 GiB unset -> 30 GiB unset), but we always pin `KV_CACHE_MEMORY` explicitly, so
+  nothing moves automatically. The fix's actual target was TP=3's margin problem, not TP=2 -- confirmed via
+  `/metrics`'s `cache_config_info` on the live trial before promoting.
+- **Decode comparison still open.** `gate/conc.py`/`gate/decode.py` are byte-identical between the old and new
+  trees, but the original promotion's "39.2/62.5/88.4" c1/c2/c4 figures weren't produced by either script (no
+  matching bench tool found anywhere in the repo) -- there is no valid apples-to-apples decode number yet. Needs
+  a dedicated re-test with a documented, repeatable tool if a real decode delta is wanted.
+- **GSM8K/HumanEval still unavailable** -- `quality-data` has never been present on this fleet; same gap as both
+  the 2026-10-19 and 2026-10-22 trials. NLL vs bf16 is clean (+0.001 to +0.004).
+- Migration mechanics: worker's `~/work/exlr8` is a real git checkout (`git checkout 6f5ede7` +
+  `git submodule update --init --recursive`); head's is a files-only deploy with no `.git`, kept in sync via
+  `rsync -a --delete --exclude='.git'` from the worker. Release weights swapped via `mv` (same filesystem as the
+  old release, so an instant rename, not a copy) into `/models/exlr8/glm-5.3-flash/exlr8-release`; the old
+  `20b80d3`-era release was kept alongside as `exlr8-release.20b80d3-backup` (117 GiB) rather than deleted, in
+  case a fast rollback to the exact old checkpoint is ever needed independently of the kindling fallback. The
+  separate `~/work/exlr8-pr11` trial worktree and `/models/exlr8-pr11` trial weights were removed on both nodes
+  after the swap -- no parallel "-pr11"-named checkout remains anywhere.
+- Post-promotion watch: 3 health polls over ~2 min, 2 more real inference requests (both correct), error scan on
+  both nodes' `vllm-worker.log` clean (no tracebacks/OOM/Xid). Boot took 420s (7 min) on the fresh snapshot tag,
+  as expected for a first boot of a new `EXLR8_TAG`.
+- Known losses vs kindling, updated: custom weight format and kernel with one upstream (unchanged) -- multimodal
+  is no longer in this list. Kindling (`recipes/kindling/kindling.sh start`) remains the documented fallback,
+  unchanged; v22 remains the second fallback.
+
 ## Upstream sweep, 2026-10-21 (exlr8 TP=2 is the live stack; read-only, nothing restarted)
 
 Delta since the last full sweep (2026-10-09) plus the exlr8 promotion (2026-10-19). Checked via `gh api`
