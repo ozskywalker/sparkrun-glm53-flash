@@ -875,3 +875,66 @@ serve --force` is unaffected by either bug, having run successfully 3 times tota
 emergency restores plus the original promotion). **No PR#11 test-battery data exists yet** -- multimodal smoke
 test, quality gates, decode/prefill benchmarks, and the TP=2 KV-pool-size question are all still open; see the
 next section once a clean run produces them.
+
+## exlr8-gx10 PR#11 trial, attempt 3: real data (2026-10-22)
+
+Third attempt, externally supervised per the incident above: no self-managed deadman in `trial_pr11.sh` at all
+(added a `start-noarm` case that skips `arm()`); the operator armed an independent detached
+`sleep N; <abs-path>/exlr8.sh serve --force` directly, extended manually across check-ins, no disarm/pkill chain
+on either side. Reused the image/weights/tree from the first two attempts (no rebuild). Launched 12:06, healthy
+12:09 (120s, fast-path snapshot reuse), test battery run against the live trial, restored 12:33-12:35 (105s).
+Clean start to finish -- the structural fix (no self-reference anywhere in the safety path) held.
+
+**Multimodal: works.** Full `smoketest/run.sh` 8/8 passed, including `image_question` (correctly read "1450"
+from the test table image) -- the vision tower loads and serves. First confirmed multimodal response from this
+checkpoint lineage on this fleet.
+
+**Quality:** NLL vs bf16 reference clean (notes +0.0030, arx.cu +0.0040, snap.py +0.0010 -- all comparable to the
+original trial's "within 0.004 of bf16"). `quality-data` is still absent on this fleet, so GSM8K/HumanEval are
+skipped again, same gap as the 2026-10-19 trial.
+
+**Decode: inconclusive by direct comparison, not a finding either way.** `gate/conc.py 1 2 4` (code+prose
+4-prompt mix, repeatable across two runs: 88.4/77.8/103.0 then 86.9/76.2/102.0 tok/s) and `gate/decode.py`
+per-workload (structured 117.2, code 86.1, prose 43.7 tok/s; DFlash2 accept 98.3%/72.1%/36.5% respectively --
+acceptance tracks how predictable the continuation is, as expected) are both unchanged byte-for-byte between the
+old (`20b80d3`) and new (`6f5ede7`) trees (`diff` confirmed identical). But the original EXLR8 promotion table's
+"39.2/62.5/88.4" c1/c2/c4 figures don't match this tool's output format or prompts, and no bench script producing
+that exact table exists anywhere in the repo or scratchpad -- it was evidently a different, undocumented
+methodology. **Do not read the gap between 88.4/77.8/103.0 here and 39.2/62.5/88.4 there as a decode regression
+or improvement; the two numbers were not produced the same way.** A real decode comparison needs the same tool
+run back-to-back against both builds, not done this round because production was down and time-boxed.
+
+**Prefill: a real, matched-methodology gain.** Wrote a small concurrent cold-prefill probe
+(`~/work/exlr8-pr11-trial-tools/cold_prefill_conc.py`, same no-shared-prefix-per-stream principle `gate/prefill.py`
+documents) and ran it at 32k tokens, c1/c2/c4:
+
+| | c1 | c2 | c4 |
+|---|---|---|---|
+| production (`20b80d3`, 2026-10-19 measurement) | 2,243 | 2,089 | 2,338 |
+| PR#11 (`6f5ede7`, this measurement) | 2,378 | 2,369 | 2,447 |
+| delta | +6.0% | +13.4% | +4.7% |
+
+This one *is* the same kind of measurement (cold, no-cache, concurrent, tok/s) even though the exact prompt text
+differs -- the gain is real and lands hardest at c2 (+13.4%).
+
+**KV pool at TP=2: unchanged, by design.** `/metrics`'s `vllm:cache_config_info` on the trial build:
+`kv_cache_memory_bytes="21474836480"` (20 GiB, matched to production), `kv_cache_size_tokens="3050402"` --
+**identical** to current production's pool size. The upstream fix changes the *default* KV pin for exlr8 at
+TP=2 from 8 GiB to 30 GiB when `KV_CACHE_MEMORY` is left unset, but we always set it explicitly, so nothing
+changes for us automatically. The fix's actual target was TP=3's margin problem, not TP=2. Takeaway: if we ever
+want more KV at TP=2, upstream's own tuning now says 30 GiB is safe there (we're not testing that configuration
+this round, 20 GiB was chosen to match the existing production baseline for a clean A/B).
+
+**Stability (short):** no errors, tracebacks, OOM, or Xid lines in either node's `vllm-worker.log` across the
+~27-minute trial. MemAvailable 9-11 GiB under load (worker 11 GiB, head 8.9 GiB) -- comparable to the original
+trial's arm B figure (12-14 GiB), slightly lower but under active benchmark load, not idle. No multi-hour soak
+run this round (time-boxed, externally supervised); not evidence against a longer soak, just not attempted.
+
+**Read:** multimodal restored (real win, reverses a documented production limitation), prefill +5-13% (real,
+matched-methodology win), KV pool neutral at our TP=2 config (no loss, no automatic gain), quality clean, no
+regressions observed. Decode has no valid comparison this round -- open. Not tested: GSM8K/HumanEval (missing
+data, same gap as before), a long soak, a reboot-resume, and the heavier maintenance burden of a second
+upstream-tracked checkpoint+kernel+vLLM-tree dependency alongside production's existing one. On what was
+measured, this looks like a legitimate upgrade candidate over the current `20b80d3` pin -- promotion (and
+whether to invest in a decode re-test and a longer soak first) is the operator's call, nothing was promoted by
+this trial.
