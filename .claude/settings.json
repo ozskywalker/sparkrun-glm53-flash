@@ -1,0 +1,30 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__grafana__query_prometheus",
+      "Bash(sparkrun logs *)",
+      "Bash(sparkrun status *)",
+      "Bash(sparkrun status)",
+      "Bash(nvidia-smi)",
+      "Bash(nvidia-smi --query*)",
+      "Bash(journalctl *)",
+      "mcp__grafana__get_dashboard_property",
+      "mcp__grafana__list_prometheus_metric_names",
+      "mcp__grafana__list_prometheus_label_values",
+      "mcp__grafana__list_datasources",
+      "mcp__grafana__get_dashboard_summary",
+      "mcp__grafana__search_dashboards",
+      "mcp__grafana__get_dashboard_panel_queries",
+      "mcp__grafana__get_dashboard_by_uid",
+      "mcp__grafana__get_panel_image",
+      "mcp__grafana__user_info",
+      "mcp__grafana__get_doc",
+      "mcp__grafana__search_docs",
+      "Bash(systemctl status *)",
+      "Bash(systemctl is-active *)",
+      "Bash(swapon --show)",
+      "Bash(docker top *)",
+      "Bash(hf cache list*)"
+    ]
+  }
+}
