@@ -818,3 +818,60 @@ already tracked here).
 **Net for us:** Finding 1 (exlr8 multimodal + per-TP KV pin fix) is the one item worth a real trial -- it
 directly reverses a known production limitation and we're already downloading the checkpoint revision it needs.
 Everything else is tracking-only this round.
+
+## exlr8-gx10 PR#11 trial: two deadman incidents before any real data (2026-10-21/22)
+
+Attempting to trial the upstream delta from Finding 1 above (`kindlingai/glm-5.3-flash-exlr8-gx10` `origin/main`
+`6f5ede7`, 16 commits past our `20b80d3` pin -- vision tower + per-TP KV pin). Setup: isolated `~/work/exlr8-pr11`
+worktree on both nodes (code tree rsync'd worker->head since head had no git checkout, only a files-only deploy),
+image built as `spark-glm53:pr11` on both nodes (worker: cache-hit, ~8s; head: real build, ~6.3 min for the
+flashkda CUDA extension alone), and the full assembled release (`kindlingai/glm-5.3-flash-exlr8-k2-k3-k4` @
+`6425b75`, all three widths, 336 GiB on disk -- bigger than the HF API's 223 GiB estimate) materialized via
+`hf download --local-dir` on the worker, then **rsync'd worker->head over the cluster network** (~300 MB/s,
+~19 min) since each node has independent local storage, not shared NFS -- `/models/exlr8`-style paths looked
+like they might be symlinked/shared from a stray `docker inspect` mount-format misread; they are not. The vision
+tower file (`dense/vision-bf16.safetensors`) is confirmed present in the downloaded checkpoint, and `MODELS_ROOT`
+(not `MODEL_DIR`) is the host-side knob that needs to point at the new release (`exlr8.yaml` bind-mounts it to
+`/models/nas` in-container; `MODEL_DIR`'s default in-container path is unchanged).
+
+Rather than reuse `recipes/exlr8/exlr8.sh` as-is (it assumes kindling is production and always restores to it),
+a one-off `trial_pr11.sh` was written mirroring its arm/disarm/down_all/launch pattern, pointed at the isolated
+tree/image/release, with its `restore` case calling the **real** `exlr8.sh serve --force` (today's actual
+production, `20b80d3`) instead of kindling. **Two separate bugs in that script each defeated the deadman safety
+net before any test battery data was collected:**
+
+1. **Attempt 1 (launched 15:36:42, budgeted 75 min):** the deadman command was built as
+   `bash -c "sleep N; '$0' restore"`. `$0` at that point was the bare relative invocation string
+   (`trial_pr11.sh`, no path -- the script was run as `bash trial_pr11.sh ...` from its own directory), not a
+   path reference. When the timer fired (~16:52), `bash -c` tried to run `trial_pr11.sh` as a **command** (PATH
+   lookup, not a file reference) and failed instantly: `bash: line 1: trial_pr11.sh: command not found`, logged
+   once, then the deadman process exited. The trial ran **completely unsupervised for ~4.5 hours past when the
+   safety net should have fired (~5h46m total outage, 15:36->21:22)** before the operator noticed via an external
+   check (StartedAt timestamp + health probe) that production had never come back. The maintenance-pause file the
+   watchdog reads had also lapsed ~3.7h earlier with no visible separate intervention from that side -- not
+   chased further here, but worth checking independently. Manually restored via `exlr8.sh serve --force`
+   (absolute path), verified with a real inference completion, not just a health ping.
+2. **Attempt 2 (launched 22:57:42, budgeted 90 min, deadman rewritten to resolve an absolute `$SELF` path via
+   `readlink`-equivalent logic, checked executable, syntax-checked, and dry-run status-tested before arming --
+   confirmed via `/proc/<pid>/cmdline` to actually carry the absolute path this time):** the path bug is fixed
+   and the deadman **did** fire correctly on schedule (00:27:42, exactly 90 min later) and did invoke `restore`
+   via the right path. But `restore`'s first line calls `disarm()`, which runs `pkill -P "$(cat deadman.pid)"`.
+   `deadman.pid` holds the PID of the detached `sleep N; ... restore` wrapper, and the `restore` invocation is
+   **itself a child of that same wrapper process** -- so `pkill -P <wrapper-pid>`, called from inside the restore
+   script, matches and kills the restore script's own process. One line is logged
+   (`"restore: stopping pr11 trial, starting ACTUAL production"`), then the process is SIGTERM'd by its own
+   cleanup step before `down_all`/relaunch ever run. The trial ran unsupervised for a further ~2 hours
+   (00:27->01:16) before the operator caught it via the same external StartedAt/health check pattern. Manually
+   restored the same way, verified the same way.
+
+**Root cause in common:** both bugs are reentrancy/self-reference problems in a deadman script that both arms
+*and is* the thing being disarmed -- a generic arm/disarm/restore pattern copied from `exlr8.sh` (which only ever
+restores to a *different* stack, kindling, and so never hits this) applied to a script whose own restore path
+calls back into itself. **Fix adopted for the next attempt:** the external safety net is a plain detached
+`sleep N; <absolute-path>/recipes/exlr8/exlr8.sh serve --force` armed independently (not through any
+`trial_pr11.sh`/disarm/pkill chain at all), extended manually by the operator on a cadence tied to real check-ins
+rather than one long unattended timer. Both outages: production itself recovered cleanly both times (`exlr8.sh
+serve --force` is unaffected by either bug, having run successfully 3 times total through this incident: 2
+emergency restores plus the original promotion). **No PR#11 test-battery data exists yet** -- multimodal smoke
+test, quality gates, decode/prefill benchmarks, and the TP=2 KV-pool-size question are all still open; see the
+next section once a clean run produces them.
